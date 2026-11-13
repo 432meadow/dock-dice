@@ -1,0 +1,13 @@
+# SwiftPM build output
+.build/
+# Assembled app bundle and generated icon
+build/
+# macOS and editor noise
+.DS_Store
+*.swp
+.swiftpm/
+xcuserdata/
+*.xcodeproj/
+# Local logs and debug snapshots
+*.log
+snap*/
