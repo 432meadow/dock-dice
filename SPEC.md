@@ -230,3 +230,22 @@ What the app does now beyond the sections above. Where this section and the sect
 - **Hot streak.** Three natural sixes in a row turn the die and the tile gold for the next roll, with a chime. Another natural six keeps it gold; anything else reverts it when that roll settles. Loaded rolls reset the streak and end gold.
 - **Bored die.** After 3 min resting untouched, the die wobbles; again 20 s later; 60 s after that it rolls home in quarter-turn hops and docks itself. Any interaction resets this. Rendering wakes only for these animations. `DICE_BORED_AFTER=<s>` shortens the first delay and scales the others (minimum 1.5 s).
 - **Demo mode** walks every path through `handleTapEvent` with synthetic events: throw, pause-throw, shake, Option release, right-click, hand drop, Trash, three forced sixes, natural rolls, Friday off/on, boredom. `DICE_DEMO_STEPS=a,b,...` picks steps. In demo mode without Accessibility, a hidden Dock shaped like the user's is simulated.
+
+### Batch 3: Hot Hand (hidden five-dice game)
+
+An original push-your-luck game in the folk "bank it or risk it" family. It is an easter egg:
+nothing in the menus mentions it, and the name never appears in the app.
+
+- **Getting in.** Hold Option while dragging the Dice tile off the Dock: a handful of five dice comes out. A plain drag or click still gives the single die, unchanged.
+- **The dice.** Five standard dice, values 1–6, opposite faces summing to 7. Four use the current palette; one is the special die, always gold. Game dice use a constellation pip style (the standard pip positions as dots joined by hairlines). The special die's 1 face is the wild, drawn as an open ring. The single die and the Dock tile keep plain pips.
+- **Scoring (Scoring.swift, pure functions).** Only the dice thrown this time count together. Each 1 scores 100, each 5 scores 50. Three or more of a face score face × 100 (1s: 1000), doubled for each die beyond three. The wild takes whichever value scores most: it joins a pair or extends a set, otherwise it is a 1. A throw with nothing scoring is a bust and the turn's points are lost. When all five dice have been kept they all come back and the turn carries on; banking is still allowed. No minimum to bank, no end goal, solo.
+- **A turn.** Grab any live die and the live dice gather under the cursor as a loose handful; shake-to-rattle works; release throws them all. When they settle, scoring dice glow and slide into a row by the Dock edge above the Dice tile. Clicking a kept loose 1 or 5 hands it back (never the last die kept from a throw). Right-click any die, or drop the handful on the Dock, to bank. On a bust the dice dim and shuffle home.
+- **Score display (Hud.swift).** A small pill beside the kept row shows the turn total. The banked total is the Dock tile's badge, stored in UserDefaults; the Dock menu shows "Reset Score" while it is above zero.
+- **Existing extras in game mode.** Loaded die and hot-streak gold are off. The bored timer banks the turn and goes home. Dropping the handful on the Trash forfeits the turn.
+- **Dice collide with each other, everywhere.**
+  - Rolling dice are dynamic bodies in one category and collide normally.
+  - Kept dice in the row carry a static, die-sized body, so thrown dice knock against the row instead of rolling through it. `.place` and `.hold` replace any non-dynamic body with a dynamic one when a die comes back into play.
+  - Held dice are driven by setting their velocity each step, which cancels the physics solver's own separation, so a handful used to sink into itself. Held neighbours closer than 1.3 units are now pushed apart, and the handful ring is sized so neighbours rest about 1.35 apart.
+  - Scripted animations (keep slide, shuffle home, the return into the Dock tile) have no physics body, so dice converging on the tile still pass through each other. That is deliberate: five dice are entering one tile.
+  - With `DICE_DEBUG`, any pair of dice whose bodies intersect is logged as `SCENE OVERLAP`.
+- **Engineering.** Per-die state lives in a `Die` object (node, visual child, mode, rest tracking); the scene holds an array, and commands, settle callbacks and hit tests carry a die index. `HandGame.swift` owns the turn; `Scoring.swift` has a launch self-check table in place of unit tests. The demo walkthrough has a `game` step that plays a full sequence with forced faces (marked DEMO-ONLY in the log).

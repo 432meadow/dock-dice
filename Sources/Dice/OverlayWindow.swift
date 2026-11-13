@@ -4,6 +4,7 @@ import SceneKit
 /// Transparent, click-through, full-screen window holding the SCNView. Never key, never main.
 final class OverlayWindow: NSWindow {
     let scnView: SCNView
+    let hud: HudView
     let dice: DiceScene
     let edgePoints: CGFloat
     let screenFrame: CGRect     // AppKit space
@@ -15,6 +16,7 @@ final class OverlayWindow: NSWindow {
                          halfHeight: screenFrame.height / edgePoints / 2,
                          blobShadow: blobShadow)
         scnView = SCNView(frame: NSRect(origin: .zero, size: screenFrame.size), options: nil)
+        hud = HudView(frame: NSRect(origin: .zero, size: screenFrame.size))
         super.init(contentRect: screenFrame, styleMask: [.borderless], backing: .buffered, defer: false)
 
         isOpaque = false
@@ -37,7 +39,15 @@ final class OverlayWindow: NSWindow {
         scnView.scene = dice.scene
         scnView.pointOfView = dice.cameraNode
         scnView.delegate = dice
-        contentView = scnView
+        // A clear container holds the SCNView and, above it, the (click-through) score HUD.
+        let container = NSView(frame: NSRect(origin: .zero, size: screenFrame.size))
+        container.wantsLayer = true
+        container.layer?.backgroundColor = NSColor.clear.cgColor
+        scnView.autoresizingMask = [.width, .height]
+        hud.autoresizingMask = [.width, .height]
+        container.addSubview(scnView)
+        container.addSubview(hud)
+        contentView = container
         setFrame(screenFrame, display: false)
     }
 
@@ -69,9 +79,21 @@ final class OverlayWindow: NSWindow {
         return CGPoint(x: s.x * k, y: s.y * k)
     }
 
-    /// The die's projected screen circle (CG space).
-    func dieCircle() -> (center: CGPoint, radius: CGFloat) {
-        let p = dice.publishedPosition
+    /// Window-local AppKit point for a global CG point (for the HUD).
+    func localPoint(fromCG p: CGPoint) -> CGPoint {
+        let a = Coords.appKit(fromCG: p)
+        return CGPoint(x: a.x - screenFrame.minX, y: a.y - screenFrame.minY)
+    }
+
+    /// Window-local AppKit point for a scene point on the z plane `z` (projected through the camera).
+    func localPoint(fromScene s: SCNVector3) -> CGPoint {
+        let k = dice.cameraHeight / (dice.cameraHeight - s.z)
+        return CGPoint(x: s.x * k * edgePoints + screenFrame.width / 2, y: s.y * k * edgePoints + screenFrame.height / 2)
+    }
+
+    /// A die's projected screen circle (CG space). Die 0 by default.
+    func dieCircle(_ i: Int = 0) -> (center: CGPoint, radius: CGFloat) {
+        let p = dice.position(of: i)
         let k = dice.cameraHeight / (dice.cameraHeight - p.z)
         return (cgPoint(fromSceneXY: CGPoint(x: p.x * k, y: p.y * k)), 0.8 * k * edgePoints)
     }

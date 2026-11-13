@@ -21,69 +21,87 @@ func dlog(_ message: @autoclosure () -> String) {
 enum DieState: String {
     case docked, held, rolling, resting, returning
     case trashed     // eaten by the Trash; the tile stays empty for a few seconds
+    case game        // Hot Hand: five dice out (HandGame.swift); single-die paths stand aside
 }
 
 /// Owns the state machine and wires the tap, the Dock locator, the overlay, the tile and sound together.
 final class AppDelegate: NSObject, NSApplicationDelegate, InputTapHandler {
-    private(set) var state: DieState = .docked
-    private let dock = DockLocator()
-    private let tap = InputTap()
-    private let thrower = ThrowController()
-    private var tile: DockTileRenderer!
-    private var sound: SoundBoard!
-    private var overlay: OverlayWindow?
-    private var lastFace = 5
-    private var lastTilePoint: CGPoint?          // CG space; where the die last left / should return
-    private var trustedLast: Bool?
-    private var tapFailLogged = false
-    private var pollTimer: Timer?
-    private var heldTileTimer: Timer?
-    private var settleCount = 0
+    var state: DieState = .docked
+    let dock = DockLocator()
+    let tap = InputTap()
+    let thrower = ThrowController()
+    var tile: DockTileRenderer!
+    var sound: SoundBoard!
+    var overlay: OverlayWindow?
+    var lastFace = 5
+    var lastTilePoint: CGPoint?          // CG space; where the die last left / should return
+    var trustedLast: Bool?
+    var tapFailLogged = false
+    var pollTimer: Timer?
+    var heldTileTimer: Timer?
+    var settleCount = 0
     // shadowOnly rendered no shadow over the transparent window (checked on screen), so the blob
     // shadow is the default. DICE_SHADOW=shadowonly brings back the spec's first approach for testing.
-    private let blobShadow = env["DICE_SHADOW"] != "shadowonly"
+    let blobShadow = env["DICE_SHADOW"] != "shadowonly"
     /// Held target stays this far (scene units) from the screen edges, so a tumbling held die
     /// (half-diagonal ~0.71) rests near the edge without rattling against the wall.
     static let heldMargin: CGFloat = 0.8
-    private let snapshotDir = env["DICE_SNAPSHOT_DIR"]
+    let snapshotDir = env["DICE_SNAPSHOT_DIR"]
     /// While holding the die in the drop zone, let drags through as mouseMoved so an autohidden
     /// Dock may reveal. On by default; DICE_REVEAL_DOCK=0 turns it off without a rebuild.
-    private let revealDock = env["DICE_REVEAL_DOCK"] != "0"
+    let revealDock = env["DICE_REVEAL_DOCK"] != "0"
 
-    private enum Gesture {
+    enum Gesture {
         case none
         case dockPress(start: CGPoint, drags: Int)
         case holding(source: String, drags: Int)
+        case keptPress(die: Int)     // Hot Hand: mouse down on a kept die (click hands it back)
     }
-    private var gesture = Gesture.none
-    private var rightClickOnDie = false         // swallowed right-down; swallow its right-up too
-    private var heldZone = DropZone.Kind.none   // drop-zone cue state while held
-    private var revealActive = false            // drags currently passed as mouseMoved
-    private var revealCount = 0
-    private var dockShowingWhileHeld: Bool?
-    private var returnStyle = DiceScene.ReturnStyle.drop
-    private var scriptRunning = false
+    var gesture = Gesture.none
+    var rightClickOnDie = false         // swallowed right-down; swallow its right-up too
+    var heldZone = DropZone.Kind.none   // drop-zone cue state while held
+    var revealActive = false            // drags currently passed as mouseMoved
+    var revealCount = 0
+    var dockShowingWhileHeld: Bool?
+    var returnStyle = DiceScene.ReturnStyle.drop
+    var scriptRunning = false
 
     // Easter eggs
-    private var fridayOverride: Bool? = {
+    var fridayOverride: Bool? = {
         switch env["DICE_FRIDAY13"] { case "1": return true; case "0": return false; default: return nil }
     }()
-    private var fridayActive = false
-    private var goldActive = false
-    private var appliedPalette = ""
-    private var naturalSixes = 0
-    private var rollLoaded = false
-    private var demoForceSix = false
-    private var trashTimer: Timer?
-    private let boredAfter: TimeInterval = Double(env["DICE_BORED_AFTER"] ?? "") ?? 180
-    private var boredTimer: Timer?
-    private var boredStage = 0
+    var fridayActive = false
+    var goldActive = false
+    var appliedPalette = ""
+    var naturalSixes = 0
+    var rollLoaded = false
+    var demoForceSix = false
+    var trashTimer: Timer?
+    let boredAfter: TimeInterval = Double(env["DICE_BORED_AFTER"] ?? "") ?? 180
+    var boredTimer: Timer?
+    var boredStage = 0
+
+    // Hot Hand (HandGame.swift)
+    var game: HandGame?
+    var dockPressOption = false
+    var demoForceTileHit = false          // DEMO-ONLY: treat the next Dock press as our tile
+    var demoPendingForce: [Int: Int]?     // DEMO-ONLY: die index -> face to force on the next game throw
+    var demoGameQueue: [(String, () -> Void)] = []
+    var demoGameRunning = false
+    static var bankedKey: String { isDemo ? "handBanked.demo" : "handBanked" }   // demo never touches the real score
+    var bankedTotal: Int {
+        get { UserDefaults.standard.integer(forKey: Self.bankedKey) }
+        set { UserDefaults.standard.set(newValue, forKey: Self.bankedKey); tile?.setBadge(newValue) }
+    }
 
     // MARK: Launch
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         dlog("LAUNCH pid=\(getpid()) bundle=\(Bundle.main.bundlePath) macOS=\(ProcessInfo.processInfo.operatingSystemVersionString) demo=\(isDemo) shadow=\(blobShadow ? "blob" : "shadowOnly")")
         dlog("LAUNCH \(DiceScene.selfCheck())")
+        let sc = HandScoring.selfCheck()
+        dlog("LAUNCH Hot Hand scoring self-check \(sc.ok ? "OK" : "FAILED") (\(sc.lines.count) cases)")
+        for line in sc.lines { dlog("LAUNCH   score \(line)") }
         let zc = DropZone.selfCheck()
         dlog("LAUNCH drop-zone self-check \(zc.ok ? "OK" : "FAILED") (band depth \(Int(DropZone.bandDepth)) pt); reveal-Dock rewrite \(revealDock ? "ON" : "OFF (DICE_REVEAL_DOCK=0)")")
         for line in zc.lines { dlog("LAUNCH   zone \(line)") }
@@ -92,6 +110,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, InputTapHandler {
         tile = DockTileRenderer()
         refreshSkin("launch")
         tile.showFace(lastFace, palette: currentPalette())
+        if isDemo { UserDefaults.standard.set(0, forKey: Self.bankedKey) }
+        tile.setBadge(bankedTotal)
+        dlog("GAME banked total at launch: \(bankedTotal) (key \(Self.bankedKey))")
         tap.handler = self
 
         let opts = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary
@@ -113,7 +134,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, InputTapHandler {
         }
     }
 
-    private func poll() {
+    func poll() {
         let trusted = AXIsProcessTrusted()
         if trusted != trustedLast {
             dlog("AX trust changed: \(trustedLast.map(String.init) ?? "?") -> \(trusted)")
@@ -124,7 +145,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, InputTapHandler {
         refreshSkin("poll")
     }
 
-    private func tryStartTap(reason: String) {
+    func tryStartTap(reason: String) {
         guard !tap.isInstalled else { return }
         if tap.start() {
             dlog("MODE gesture: event tap installed (\(reason)); AX trusted=\(AXIsProcessTrusted())")
@@ -135,8 +156,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, InputTapHandler {
         }
     }
 
-    @objc private func screensChanged() {
+    @objc func screensChanged() {
         dlog("SCREENS changed: recalling die (instant) and dropping overlay for refit")
+        if state == .game { gameAbortForScreenChange() }
         if state != .docked && state != .trashed {
             overlay?.dice.send(.hideNow)
             finishDocking(reason: "screen parameters changed", sound: false)
@@ -150,13 +172,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, InputTapHandler {
 
     /// Build the overlay, scene and textures ahead of time (hidden), so the first pull never does
     /// that work inside the event-tap callback (it took ~83 ms there and stalled the tap).
-    private func prewarmOverlay(_ why: String) {
+    func prewarmOverlay(_ why: String) {
         let t0 = ProcessInfo.processInfo.systemUptime
-        _ = ensureOverlay()     // (SCNView.prepare(_:) hung here at launch, so it is not used)
+        let o = ensureOverlay()     // (SCNView.prepare(_:) hung here at launch, so it is not used)
+        o.dice.warmTextures()
         dlog(String(format: "OVERLAY prewarmed (%@) in %.0f ms", why, (ProcessInfo.processInfo.systemUptime - t0) * 1000))
     }
 
-    @objc private func dayChanged() { refreshSkin("calendar day changed") }
+    @objc func dayChanged() { refreshSkin("calendar day changed") }
 
     // MARK: Dock integration
 
@@ -164,6 +187,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, InputTapHandler {
         let mouse = Coords.cg(fromAppKit: NSEvent.mouseLocation)
         dlog("REOPEN (Dock click reached the Dock, so the tap did not swallow it: tap installed=\(tap.isInstalled)) state=\(state.rawValue) mouse=\(fmt(mouse))")
         switch state {
+        case .game:
+            gameBank(reason: "Dock icon click (reopen)", heldStyle: .shot)
         case .docked:
             // Without AX the tile frame is unknown; a real Dock click leaves the mouse on the tile.
             if dock.tileFrame == nil, dockEdgeBand().contains(mouse) { lastTilePoint = mouse }
@@ -188,18 +213,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate, InputTapHandler {
         snd.state = sound.enabled ? .on : .off
         snd.isEnabled = !sound.forcedMute
         menu.addItem(snd)
+        if bankedTotal > 0 {
+            let reset = NSMenuItem(title: "Reset Score", action: #selector(resetScore), keyEquivalent: "")
+            reset.target = self
+            menu.addItem(reset)
+        }
         return menu
     }
 
-    @objc private func recallFromMenu() {
+    @objc func resetScore() {
+        dlog("GAME score reset from \(bankedTotal) (Dock menu)")
+        bankedTotal = 0
+    }
+
+    @objc func recallFromMenu() {
+        if state == .game { gameBank(reason: "Dock menu Recall Die", heldStyle: .shot); return }
         if state == .trashed { restoreFromTrash("Dock menu Recall Die") } else { returnToDock(reason: "Dock menu Recall Die", style: .shot) }
     }
 
-    @objc private func toggleSound() { sound.enabled.toggle() }
+    @objc func toggleSound() { sound.enabled.toggle() }
 
     // MARK: State
 
-    private func setState(_ s: DieState, _ why: String) {
+    func setState(_ s: DieState, _ why: String) {
         guard s != state else { return }
         let old = state
         dlog("STATE \(state.rawValue) -> \(s.rawValue) (\(why))")
@@ -212,7 +248,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, InputTapHandler {
             sound.idle(after: 3, "die resting")
         case .docked, .trashed:
             sound.idle(after: 1.5, "die \(s.rawValue)")
-        case .held, .rolling:
+        case .held, .rolling, .game:
             sound.wake("die \(s.rawValue)")
         case .returning:
             break
@@ -220,7 +256,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, InputTapHandler {
     }
 
     /// The screen holding the Dock tile.
-    private func dockScreen() -> NSScreen {
+    func dockScreen() -> NSScreen {
         if let f = dock.tileFrame {
             // A hidden Dock's tile sits just off the screen edge, so allow some slack.
             let c = Coords.appKit(fromCG: CGPoint(x: f.midX, y: f.midY))
@@ -242,16 +278,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate, InputTapHandler {
         return NSScreen.screens.first!
     }
 
-    private func ensureOverlay() -> OverlayWindow {
+    func ensureOverlay() -> OverlayWindow {
         let screen = dockScreen()
         if let o = overlay, o.screenFrame == screen.frame { return o }
         overlay?.orderOut(nil)
         let tileSize = dock.tileFrame?.width ?? dock.prefs.tileSize
         let edge = min(max(tileSize * 0.8, 44), 72)
         let o = OverlayWindow(screen: screen, edgePoints: edge, blobShadow: blobShadow)
-        o.dice.onSettled = { [weak self] face, secs, ep in self?.settled(face: face, seconds: secs, epoch: ep) }
-        o.dice.onReturned = { [weak self] ep in self?.returned(epoch: ep) }
-        o.dice.onScriptDone = { [weak self] name, ep in self?.scriptDone(name, epoch: ep) }
+        o.dice.onSettled = { [weak self] i, face, secs, ep in
+            guard let self else { return }
+            if self.game != nil { self.gameSettled(i, face: face, epoch: ep) } else if i == 0 { self.settled(face: face, seconds: secs, epoch: ep) }
+        }
+        o.dice.onReturned = { [weak self] i, ep in
+            guard let self else { return }
+            if self.game != nil { self.gameReturned(i, epoch: ep) } else if i == 0 { self.returned(epoch: ep) }
+        }
+        o.dice.onScriptDone = { [weak self] i, name, ep in
+            guard let self else { return }
+            if self.game != nil { self.gameScriptDone(i, name, epoch: ep) } else if i == 0 { self.scriptDone(name, epoch: ep) }
+        }
+        o.dice.onWoke = { [weak self] i in self?.gameWoke(i) }
         o.dice.onSound = { [weak self] name, vol, detail in self?.sound.play(name, volume: vol, detail: detail) }
         overlay = o
         appliedPalette = ""
@@ -262,7 +308,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, InputTapHandler {
     }
 
     /// Where the tile is (CG). Falls back to the last known point, then the Dock edge centre.
-    private func tilePoint() -> CGPoint {
+    func tilePoint() -> CGPoint {
         dock.refreshTileFrame()
         if let f = dock.tileFrame { return CGPoint(x: f.midX, y: f.midY) }
         if let p = lastTilePoint { return p }
@@ -277,7 +323,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, InputTapHandler {
     }
 
     /// The drop zone (Dock and Trash) for the current Dock geometry.
-    private func dropZone() -> DropZone {
+    func dropZone() -> DropZone {
         var z = DropZone(screen: Coords.cgRect(fromAppKit: dockScreen().frame),
                          orientation: dock.prefs.orientation,
                          list: dock.listFrame,
@@ -289,7 +335,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, InputTapHandler {
 
     /// Demo without AX: inject a hidden bottom Dock shaped like the user's (list 1030 pt wide,
     /// centred, our tile 858 pt from its left end, the Trash at its right end, all below the edge).
-    private func simulateHiddenDock() {
+    func simulateHiddenDock() {
         let s = Coords.cgRect(fromAppKit: dockScreen().frame)
         let list = CGRect(x: s.midX - 515, y: s.maxY, width: 1030, height: 61)
         let tileRect = CGRect(x: list.minX + 858, y: s.maxY, width: 49, height: 61)
@@ -299,17 +345,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, InputTapHandler {
 
     // MARK: Looks (Friday the 13th, hot-streak gold)
 
-    private func isFriday13Now() -> Bool {
+    func isFriday13Now() -> Bool {
         if let o = fridayOverride { return o }
         let c = Calendar.current.dateComponents([.weekday, .day], from: Date())
         return c.weekday == 6 && c.day == 13
     }
 
-    private func currentPalette() -> DiePalette {
-        goldActive ? .gold : (fridayActive ? .friday13 : .classic)
+    /// Gold (hot streak) is a single-die egg: off in game mode.
+    func currentPalette() -> DiePalette {
+        (goldActive && game == nil) ? .gold : (fridayActive ? .friday13 : .classic)
     }
 
-    private func refreshSkin(_ why: String) {
+    func refreshSkin(_ why: String) {
         let f = isFriday13Now()
         if f != fridayActive {
             fridayActive = f
@@ -321,24 +368,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate, InputTapHandler {
         dlog("SKIN -> \(p.name) (\(why))")
         if let o = overlay {
             o.dice.applySkin(p)
+            o.hud.applyPalette(p)
             pulseRender(0.15)
         }
         if state == .docked, tile != nil { tile.showFace(lastFace, palette: p) }
     }
 
     /// Wake rendering briefly so a change shows on a paused (resting) die.
-    private func pulseRender(_ seconds: TimeInterval) {
+    func pulseRender(_ seconds: TimeInterval) {
         guard let o = overlay, o.isVisible else { return }
         o.playing = true
         DispatchQueue.main.asyncAfter(deadline: .now() + seconds) { [weak self] in
-            guard let self, self.state == .resting, !self.scriptRunning else { return }
-            self.overlay?.playing = false
+            guard let self, !self.scriptRunning else { return }
+            if self.state == .resting || (self.state == .game && self.game?.phase == .waiting) { self.overlay?.playing = false }
         }
     }
 
     // MARK: Actions
 
-    private func show(_ o: OverlayWindow) {
+    func show(_ o: OverlayWindow) {
         if !o.isVisible {
             o.orderFrontRegardless()
             dlog("OVERLAY ordered front")
@@ -358,7 +406,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, InputTapHandler {
         setState(.rolling, "pop out: \(reason); tile at \(fmt(tp)); random start orientation")
     }
 
-    private func pull(at p: CGPoint, time: TimeInterval = ThrowController.now, reason: String) {
+    func pull(at p: CGPoint, time: TimeInterval = ThrowController.now, reason: String) {
         if state == .trashed { cancelTrashTimer("die pulled out of the tile") }
         let o = ensureOverlay()
         if let f = dock.tileFrame { lastTilePoint = CGPoint(x: f.midX, y: f.midY) }
@@ -373,7 +421,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, InputTapHandler {
         beginHoldTracking()
     }
 
-    private func grab(at p: CGPoint, time: TimeInterval = ThrowController.now, reason: String) {
+    func grab(at p: CGPoint, time: TimeInterval = ThrowController.now, reason: String) {
         guard let o = overlay else { return }
         scriptRunning = false
         o.dice.setTarget(o.dice.clampXY(o.sceneXY(fromCG: p, atHeight: DiceScene.liftZ), margin: AppDelegate.heldMargin))
@@ -388,7 +436,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, InputTapHandler {
     /// Moves the held die; returns the drop-zone kind for this point (used by the tap for the
     /// reveal rewrite). Logs only when the verdict changes. Also detects shakes.
     @discardableResult
-    private func moveHeld(to p: CGPoint, time: TimeInterval = ThrowController.now) -> DropZone.Kind {
+    func moveHeld(to p: CGPoint, time: TimeInterval = ThrowController.now) -> DropZone.Kind {
         guard let o = overlay else { return .none }
         let z = dropZone().classify(p)
         let nearZone = z.kind != .none || distanceToDockEdge(p) < DropZone.bandDepth + 110
@@ -418,7 +466,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, InputTapHandler {
         return z.kind
     }
 
-    private func releaseHeld(at p: CGPoint, time: TimeInterval = ThrowController.now, option: Bool = false) {
+    func releaseHeld(at p: CGPoint, time: TimeInterval = ThrowController.now, option: Bool = false) {
         guard let o = overlay, state == .held else { return }
         if !demoInjecting { demoTimer?.invalidate() }
         thrower.add(p, at: time)
@@ -471,7 +519,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, InputTapHandler {
         if style == .shot { snapshot("shot-mid", after: duration * 0.5) }
     }
 
-    private func feedTrash() {
+    func feedTrash() {
         guard let o = overlay else { return }
         let target = dock.trashFrame.map { CGPoint(x: $0.midX, y: $0.midY) } ?? tilePoint()
         let s = o.sceneXY(fromCG: target)
@@ -482,7 +530,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, InputTapHandler {
         setState(.returning, "into the Trash at \(fmt(target))")
     }
 
-    private func returned(epoch: Int) {
+    func returned(epoch: Int) {
         guard let o = overlay, epoch == o.dice.epoch, state == .returning else {
             dlog("RETURNED callback stale (epoch \(epoch)); ignored")
             return
@@ -506,13 +554,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, InputTapHandler {
         }
     }
 
-    private func cancelTrashTimer(_ why: String) {
+    func cancelTrashTimer(_ why: String) {
         if trashTimer != nil { dlog("TRASH timer cancelled (\(why))") }
         trashTimer?.invalidate()
         trashTimer = nil
     }
 
-    private func restoreFromTrash(_ why: String) {
+    func restoreFromTrash(_ why: String) {
         guard state == .trashed else { return }
         cancelTrashTimer(why)
         setState(.docked, "back from the Trash: \(why)")
@@ -524,7 +572,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, InputTapHandler {
         }
     }
 
-    private func finishDocking(reason: String, sound playSound: Bool) {
+    func finishDocking(reason: String, sound playSound: Bool) {
         overlay?.playing = false
         overlay?.orderOut(nil)
         dlog("OVERLAY ordered out")
@@ -535,7 +583,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, InputTapHandler {
         setState(.docked, reason)
     }
 
-    private func settled(face: Int, seconds: TimeInterval, epoch: Int) {
+    func settled(face: Int, seconds: TimeInterval, epoch: Int) {
         guard let o = overlay, epoch == o.dice.epoch, state == .rolling else {
             dlog("SETTLED callback stale (face \(face), epoch \(epoch), state \(state.rawValue)); ignored")
             return
@@ -543,13 +591,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, InputTapHandler {
         if (rollLoaded || demoForceSix) && face != 6 {
             dlog("\(rollLoaded ? "LOADED" : "DEMO forced six"): settled on \(face) after \(String(format: "%.2f", seconds)) s -> deliberate hop-and-flip onto 6")
             scriptRunning = true
-            o.dice.send(.flipToSix(naturalLabel: rollLoaded ? "loaded" : "demo forced, counts as natural"))
+            o.dice.send(.flipTo(face: 6, label: rollLoaded ? "loaded" : "demo forced, counts as natural"))
             return
         }
         finishSettle(face: face, seconds: seconds)
     }
 
-    private func finishSettle(face: Int, seconds: TimeInterval) {
+    func finishSettle(face: Int, seconds: TimeInterval) {
         guard let o = overlay else { return }
         lastFace = face
         settleCount += 1
@@ -589,7 +637,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, InputTapHandler {
     }
 
     /// The loaded die winks: the 6's pips blink off for ~150 ms, with a blip.
-    private func wink() {
+    func wink() {
         guard let o = overlay else { return }
         o.playing = true
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { [weak self] in
@@ -609,7 +657,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, InputTapHandler {
         }
     }
 
-    private func scriptDone(_ name: String, epoch: Int) {
+    func scriptDone(_ name: String, epoch: Int) {
         guard let o = overlay, epoch == o.dice.epoch else {
             dlog("SCRIPT \(name) done callback stale (epoch \(epoch)); ignored")
             return
@@ -632,24 +680,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate, InputTapHandler {
 
     // MARK: Bored die
 
-    private func boredGap(_ seconds: TimeInterval) -> TimeInterval {
+    func boredGap(_ seconds: TimeInterval) -> TimeInterval {
         max(1.5, seconds * boredAfter / 180)
     }
 
-    private func scheduleBored() {
+    func scheduleBored() {
         boredTimer?.invalidate()
         boredStage = 0
         boredTimer = Timer.scheduledTimer(withTimeInterval: boredAfter, repeats: false) { [weak self] _ in self?.boredStep() }
     }
 
-    private func cancelBored(_ why: String) {
+    func cancelBored(_ why: String) {
         if boredStage > 0 { dlog("BORED reset at stage \(boredStage) (\(why))") }
         boredTimer?.invalidate()
         boredTimer = nil
         boredStage = 0
     }
 
-    private func boredStep() {
+    func boredStep() {
         guard state == .resting, let o = overlay else { return }
         boredStage += 1
         switch boredStage {
@@ -670,7 +718,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, InputTapHandler {
         }
     }
 
-    private func beginHoldTracking() {
+    func beginHoldTracking() {
         heldZone = .none
         revealActive = false
         revealCount = 0
@@ -688,7 +736,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, InputTapHandler {
         }
     }
 
-    private func endHoldTracking() {
+    func endHoldTracking() {
         heldTileTimer?.invalidate()
         heldTileTimer = nil
         if revealCount > 0 { dlog("REVEAL summary: \(revealCount) drags passed as mouseMoved during this hold") }
@@ -701,7 +749,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, InputTapHandler {
 
     /// The band along the Dock's edge of its screen, deep enough for a shown or magnified Dock (CG).
     /// Used on mouse-down to catch a click on a just-revealed Dock before the cached strip updates.
-    private func dockEdgeBand() -> CGRect {
+    func dockEdgeBand() -> CGRect {
         let s = Coords.cgRect(fromAppKit: dockScreen().frame)
         let depth = max(dock.prefs.tileSize, dock.prefs.magnification ? dock.prefs.largeSize : 0) + 40
         switch dock.prefs.orientation {
@@ -712,7 +760,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, InputTapHandler {
     }
 
     /// Distance (pt) from a CG point to the Dock's edge of the Dock screen.
-    private func distanceToDockEdge(_ p: CGPoint) -> CGFloat {
+    func distanceToDockEdge(_ p: CGPoint) -> CGFloat {
         let s = Coords.cgRect(fromAppKit: dockScreen().frame)
         switch dock.prefs.orientation {
         case "left": return p.x - s.minX
@@ -721,7 +769,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, InputTapHandler {
         }
     }
 
-    private func dieHit(_ p: CGPoint) -> (hit: Bool, note: String) {
+    func dieHit(_ p: CGPoint) -> (hit: Bool, note: String) {
         guard state == .rolling || state == .resting, let o = overlay else { return (false, "die \(state.rawValue)") }
         let c = o.dieCircle()
         let d = hypot(p.x - c.center.x, p.y - c.center.y)
@@ -740,6 +788,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, InputTapHandler {
                 releaseHeld(at: p, time: time)
             }
             gesture = .none
+            dockPressOption = false
+            if state == .game, let d = gameMouseDown(p, time: time) { return d }
             let die = dieHit(p)
             if die.hit {
                 dlog("TAP down \(fmt(p)) SWALLOW: on die (\(die.note))")
@@ -763,8 +813,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, InputTapHandler {
             let hit = dock.hitTest(p)
             let ms = (ProcessInfo.processInfo.systemUptime - t0) * 1000
             let via = inStrip ? "cached strip" : "edge band (strip stale)"
-            if hit.isOurs {
-                dlog(String(format: "TAP down %@ SWALLOW: our Dock tile via %@ (%.1f ms) %@", fmt(p), via, ms, hit.detail))
+            let forced = isDemo && demoInjecting && demoForceTileHit && !hit.isOurs
+            if hit.isOurs || forced {
+                dockPressOption = flags.contains(.maskAlternate)
+                dlog(String(format: "TAP down %@ SWALLOW: our Dock tile via %@ (%.1f ms) %@%@%@", fmt(p), via, ms, hit.detail,
+                            forced ? " [DEMO-ONLY: tile hit forced]" : "", dockPressOption ? " with Option" : ""))
                 gesture = .dockPress(start: p, drags: 0)
                 return .swallow
             }
@@ -778,9 +831,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, InputTapHandler {
             case let .dockPress(start, drags):
                 let dist = hypot(p.x - start.x, p.y - start.y)
                 if dist > 6 {
-                    dlog(String(format: "TAP drag SWALLOW: moved %.1f pt (> 6) from tile after %d drags -> pull die out at %@", dist, drags + 1, fmt(p)))
-                    gesture = .holding(source: "dock", drags: drags + 1)
-                    pull(at: p, time: time, reason: "drag off tile")
+                    let option = dockPressOption || flags.contains(.maskAlternate)
+                    if state == .game {
+                        dlog(String(format: "TAP drag SWALLOW: moved %.1f pt from tile during a game -> gather the live dice at %@", dist, fmt(p)))
+                        gesture = gameGrab(at: p, time: time, reason: "drag off tile") ? .holding(source: "game", drags: drags + 1) : .none
+                    } else if option {
+                        dlog(String(format: "TAP drag SWALLOW: moved %.1f pt (> 6) from tile with Option -> Hot Hand: pull five dice at %@", dist, fmt(p)))
+                        gesture = .holding(source: "game", drags: drags + 1)
+                        startGame(at: p, time: time)
+                    } else {
+                        dlog(String(format: "TAP drag SWALLOW: moved %.1f pt (> 6) from tile after %d drags -> pull die out at %@", dist, drags + 1, fmt(p)))
+                        gesture = .holding(source: "dock", drags: drags + 1)
+                        pull(at: p, time: time, reason: "drag off tile")
+                    }
                 } else {
                     gesture = .dockPress(start: start, drags: drags + 1)
                 }
@@ -800,6 +863,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, InputTapHandler {
                     return .passAs(.mouseMoved)
                 }
                 return .swallow
+            case .keptPress:
+                return .swallow
             }
 
         case .leftMouseUp:
@@ -812,6 +877,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, InputTapHandler {
                 switch state {
                 case .docked: popOut(reason: "tile click")
                 case .trashed: restoreFromTrash("tile click")
+                case .game: gameBank(reason: "tile click", heldStyle: .shot)
                 default: returnToDock(reason: "tile click while die out", style: .shot)
                 }
                 return .swallow
@@ -819,12 +885,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, InputTapHandler {
                 gesture = .none
                 let option = flags.contains(.maskAlternate)
                 dlog("TAP up \(fmt(p)) SWALLOW: release (from \(source), \(drags) drags handled)\(option ? " with Option" : "")")
-                releaseHeld(at: p, time: time, option: option)
+                if state == .game { gameRelease(at: p, time: time, option: option) } else { releaseHeld(at: p, time: time, option: option) }
+                return .swallow
+            case let .keptPress(die):
+                gesture = .none
+                dlog("TAP up \(fmt(p)) SWALLOW: click on kept die \(die)")
+                gameHandBack(die)
                 return .swallow
             }
 
         case .rightMouseDown:
             rightClickOnDie = false
+            if state == .game {
+                if gameRightClick(p) { rightClickOnDie = true; return .swallow }
+                dlog("TAP right-down \(fmt(p)) PASS: not on a game die; Dock menu and other right-clicks untouched")
+                return .pass
+            }
             let die = dieHit(p)
             if die.hit {
                 rightClickOnDie = true
@@ -850,15 +926,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, InputTapHandler {
 
     // MARK: Demo mode (no permission needed): drives handleTapEvent with synthetic events
 
-    private var demoStep = 0
-    private var demoTimer: Timer?
-    private var demoInjecting = false
+    var demoStep = 0
+    var demoTimer: Timer?
+    var demoInjecting = false
     /// DICE_DEMO_STEPS=step,step,... runs only those steps (names as below).
-    private let demoSteps = env["DICE_DEMO_STEPS"].map { $0.split(separator: ",").map(String.init) } ??
+    let demoSteps = env["DICE_DEMO_STEPS"].map { $0.split(separator: ",").map(String.init) } ??
         ["throw", "pause-throw", "shake", "loaded", "right-click", "hand-drop", "trash",
          "six", "six", "six", "natural", "natural", "friday-off", "throw", "friday-on", "bored"]
 
-    private func inject(_ type: CGEventType, _ p: CGPoint, flags: CGEventFlags = []) -> TapDecision {
+    func inject(_ type: CGEventType, _ p: CGPoint, flags: CGEventFlags = []) -> TapDecision {
         demoInjecting = true
         defer { demoInjecting = false }
         let t0 = ProcessInfo.processInfo.systemUptime
@@ -868,7 +944,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, InputTapHandler {
         return d
     }
 
-    private func describe(_ d: TapDecision) -> String {
+    func describe(_ d: TapDecision) -> String {
         switch d {
         case .pass: return "pass"
         case .swallow: return "swallow"
@@ -878,9 +954,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, InputTapHandler {
 
     /// Synthetic left-drag: down at `from`, drags along `path(t)` for `duration` s at 60 Hz, then no
     /// events for `pause` s (a cursor held still sends none), then up at the last point.
-    private func demoDrag(_ label: String, from: CGPoint, duration: TimeInterval, pause: TimeInterval,
-                          upFlags: CGEventFlags = [], path: @escaping (TimeInterval) -> CGPoint) {
-        let d0 = inject(.leftMouseDown, from)
+    func demoDrag(_ label: String, from: CGPoint, duration: TimeInterval, pause: TimeInterval,
+                          upFlags: CGEventFlags = [], downFlags: CGEventFlags = [], dragFlags: CGEventFlags = [],
+                          path: @escaping (TimeInterval) -> CGPoint) {
+        let d0 = inject(.leftMouseDown, from, flags: downFlags)
         dlog("DEMO \(label): synthetic leftMouseDown at \(fmt(from)) -> \(describe(d0))")
         let t0 = ThrowController.now
         var last = from
@@ -891,7 +968,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, InputTapHandler {
             let t = ThrowController.now - t0
             if t < duration {
                 last = path(t)
-                let d = self.describe(self.inject(.leftMouseDragged, last))
+                let d = self.describe(self.inject(.leftMouseDragged, last, flags: dragFlags))
                 if d != lastDecision { dlog("DEMO \(label): synthetic drags at \(fmt(last)) -> \(d)"); lastDecision = d }
             } else if t >= duration + pause {
                 timer.invalidate()
@@ -901,7 +978,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, InputTapHandler {
         }
     }
 
-    private func demoNext() {
+    func demoNext() {
         guard isDemo, state == .resting, let o = overlay else { return }
         let name = demoStep < demoSteps.count ? demoSteps[demoStep] : "throw"
         demoStep += 1
@@ -966,6 +1043,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, InputTapHandler {
             refreshSkin("demo \(name)")
             snapshot("skin-\(name)", after: 0.4)
             DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in self?.demoNext() }
+        case "game":
+            demoGameStart()
         case "bored":
             dlog("DEMO waiting for boredom: untouched for \(Int(boredAfter)) s, wobble, wobble, then shuffle home")
         default:
@@ -975,7 +1054,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, InputTapHandler {
 
     // MARK: Debug snapshots (DICE_SNAPSHOT_DIR)
 
-    private func snapshot(_ name: String, after delay: TimeInterval) {
+    func snapshot(_ name: String, after delay: TimeInterval) {
         guard let dir = snapshotDir else { return }
         DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
             guard let o = self?.overlay, o.isVisible else { return }

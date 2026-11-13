@@ -33,6 +33,14 @@ struct DiePalette: Equatable {
                                  edge: c(0.35, 0.22, 0.02, 0.45))
 }
 
+/// How the pips are drawn. `constellation` (Hot Hand game dice only) keeps the standard pip
+/// positions and dot size, and joins the dots with hairlines into small open "constellations";
+/// the 1 gets a thin orbit ring. It must still read instantly as an ordinary die.
+enum PipStyle: String {
+    case plain
+    case constellation
+}
+
 /// Core Graphics drawing of die faces. Shared by the SceneKit textures, the Dock tile and the
 /// app icon (scripts/make-icon.swift compiles this file directly), so it depends on CoreGraphics only.
 enum DieArt {
@@ -86,13 +94,78 @@ enum DieArt {
 
     /// Full-bleed square texture for one face of the SceneKit die.
     /// `pips: false` gives the bare face (used for the loaded die's wink).
-    static func texture(value: Int, px: Int = 512, palette: DiePalette = .classic, pips: Bool = true) -> CGImage {
+    /// `wild: true` with value 1 draws the Hot Hand special die's wild face: one open ring.
+    static func texture(value: Int, px: Int = 512, palette: DiePalette = .classic, pips: Bool = true,
+                        style: PipStyle = .plain, wild: Bool = false) -> CGImage {
         let ctx = makeContext(px)
         let r = CGRect(x: 0, y: 0, width: px, height: px)
         ctx.setFillColor(palette.body)
         ctx.fill(r)
-        if pips { drawPips(value, in: r, ctx: ctx, palette: palette) }
+        if pips && wild && value == 1 {
+            drawWildRing(in: r, ctx: ctx, palette: palette)
+        } else if pips {
+            if style == .constellation { drawConstellationLines(value, in: r, ctx: ctx, palette: palette) }
+            drawPips(value, in: r, ctx: ctx, palette: palette)
+        }
         return ctx.makeImage()!
+    }
+
+    /// Links between standard pip positions (unit square, y up), as star charts draw them:
+    /// short open chains, never a closed shape, never a branch or lines radiating from a centre,
+    /// and no letter-like full grid paths. Each link is a pair of points.
+    static func constellationLinks(_ value: Int) -> [(CGPoint, CGPoint)] {
+        let l: CGFloat = 0.25, c: CGFloat = 0.5, h: CGFloat = 0.75
+        func p(_ x: CGFloat, _ y: CGFloat) -> CGPoint { CGPoint(x: x, y: y) }
+        switch value {
+        case 2: return [(p(l, h), p(h, l))]
+        case 3: return [(p(l, h), p(c, c)), (p(c, c), p(h, l))]
+        case 4: return [(p(l, h), p(h, h)), (p(h, h), p(h, l))]
+        case 5: return [(p(l, l), p(l, h)), (p(l, h), p(c, c)), (p(c, c), p(h, h))]
+        case 6: return [(p(l, h), p(l, c)), (p(l, c), p(h, c)), (p(h, c), p(h, l))]
+        default: return []
+        }
+    }
+
+    /// Hairline weight shared by constellation links, the 1's orbit ring and the wild ring.
+    static func hairline(_ r: CGRect) -> CGFloat { max(1, r.width * 0.011) }
+
+    /// The wild face: a single open ring, same weight as the hairlines, nothing else.
+    static func drawWildRing(in r: CGRect, ctx: CGContext, palette: DiePalette) {
+        let ring = r.width * 0.25
+        ctx.saveGState()
+        ctx.setStrokeColor(palette.pipOuter.copy(alpha: 0.9) ?? palette.pipOuter)
+        ctx.setLineWidth(hairline(r))
+        ctx.strokeEllipse(in: CGRect(x: r.midX - ring, y: r.midY - ring, width: ring * 2, height: ring * 2))
+        ctx.restoreGState()
+    }
+
+    /// Hairlines between the dots (drawn under them), and a thin orbit ring around the lone 1.
+    static func drawConstellationLines(_ value: Int, in r: CGRect, ctx: CGContext, palette: DiePalette) {
+        let line = palette.pipOuter.copy(alpha: 0.55) ?? palette.pipOuter
+        ctx.saveGState()
+        ctx.setStrokeColor(line)
+        ctx.setLineWidth(hairline(r))
+        ctx.setLineCap(.round)
+        ctx.setLineJoin(.round)
+        func at(_ q: CGPoint) -> CGPoint { CGPoint(x: r.minX + q.x * r.width, y: r.minY + q.y * r.height) }
+        // Lines run dot to dot (drawn under the dots), as most star charts draw them.
+        let gap: CGFloat = 0
+        for (a0, b0) in constellationLinks(value) {
+            let a = at(a0), b = at(b0)
+            let len = hypot(b.x - a.x, b.y - a.y)
+            guard len > gap * 2 + 1 else { continue }
+            let ux = (b.x - a.x) / len, uy = (b.y - a.y) / len
+            ctx.move(to: CGPoint(x: a.x + ux * gap, y: a.y + uy * gap))
+            ctx.addLine(to: CGPoint(x: b.x - ux * gap, y: b.y - uy * gap))
+            ctx.strokePath()
+        }
+        if value == 1 {
+            let ring = r.width * 0.215
+            let c = at(CGPoint(x: 0.5, y: 0.5))
+            ctx.setLineWidth(hairline(r))
+            ctx.strokeEllipse(in: CGRect(x: c.x - ring, y: c.y - ring, width: ring * 2, height: ring * 2))
+        }
+        ctx.restoreGState()
     }
 
     /// Vertical gradient used as a fake environment reflection for the gold die.

@@ -100,7 +100,7 @@ Set these in the environment, for example
 ## Limitations
 
 - The die stays on the screen that holds the Dock.
-- One die at a time.
+- One die at a time in normal use.
 - Not notarised and not suitable for the Mac App Store, because of the event tap.
 
 ## Licence

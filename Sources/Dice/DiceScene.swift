@@ -29,19 +29,26 @@ func axisAngle(_ w: SCNVector3) -> SCNVector4 {
 }
 
 /// The tabletop. x/y are screen axes (origin at the screen centre), +z points at the viewer,
-/// one unit = one die edge. Everything that touches physics runs on SceneKit's render thread
-/// inside the SCNSceneRendererDelegate callbacks; the main thread talks to it through `lock`.
+/// one unit = one die edge. The table holds `DiceScene.maxDice` dice; single-die mode uses die 0
+/// only (the others stay hidden with no physics body). Everything that touches physics runs on
+/// SceneKit's render thread inside the SCNSceneRendererDelegate callbacks; the main thread talks
+/// to it through `lock`. Walls, floor, lights and camera are shared.
 final class DiceScene: NSObject, SCNSceneRendererDelegate, SCNPhysicsContactDelegate {
+    static let maxDice = 5
+
     enum Command {
         case place(position: SCNVector3, orientation: SCNQuaternion?, velocity: SCNVector3, angular: SCNVector4, held: Bool)
         case hold
         case release(velocity: SCNVector3, angular: SCNVector4)
         case returnTo(SCNVector3, duration: TimeInterval, style: ReturnStyle)
         case hideNow
-        /// Kinematic animations (physics body removed while they run, restored after).
-        case flipToSix(naturalLabel: String)   // loaded die / forced demo six: hop and flip onto 6
+        /// Kinematic animations (physics body removed while they run, restored after unless parked).
+        case flipTo(face: Int, label: String)  // loaded die / demo forcing: hop and flip onto a face
         case wobble                            // bored die fidgets in place
-        case shuffleHome(to: CGPoint)          // bored die hops toward the Dock
+        case shuffleHome(to: CGPoint)          // bored die (or busted hand) hops toward the Dock
+        /// Glide to a spot, face-up `face` with no yaw if given, at visual `scale`. `park: true`
+        /// leaves it without a physics body (a kept die in the row); otherwise it rests on the table.
+        case slide(to: SCNVector3, face: Int?, scale: CGFloat, duration: TimeInterval, park: Bool, name: String)
     }
 
     enum ReturnStyle: String {
@@ -57,24 +64,59 @@ final class DiceScene: NSObject, SCNSceneRendererDelegate, SCNPhysicsContactDele
         var start: TimeInterval?
         let step: (SCNNode, Double) -> Void
         var events: [(k: Double, sound: String, volume: Float)]
+        var park = false
         init(_ name: String, duration: TimeInterval, events: [(k: Double, sound: String, volume: Float)] = [],
              step: @escaping (SCNNode, Double) -> Void) {
             self.name = name; self.duration = duration; self.events = events; self.step = step
         }
     }
 
-    private enum Mode {
-        case idle
+    enum Mode {
+        case idle      // at rest on the table (or hidden)
         case held
         case rolling
         case returning(from: SCNVector3, to: SCNVector3, start: TimeInterval?, duration: TimeInterval, style: ReturnStyle)
         case scripted(Script)
+        case parked    // kept in the row: visible, no physics body
+    }
+
+    /// One die: its nodes, materials, and its own motion and rest tracking.
+    final class Die {
+        let index: Int
+        let node = SCNNode()          // carries the physics body; never scaled
+        let visual = SCNNode()        // carries the geometry; scaled for cues and animations
+        var blob: SCNNode?
+        var materials: [SCNMaterial] = []
+        // Render-thread state
+        var mode = Mode.idle
+        var quiet: TimeInterval = 0
+        var rollStart: TimeInterval = 0
+        var lastPosLog: TimeInterval = 0
+        var rollEpoch = 0
+        var heldScaleAtReturn: CGFloat = 1
+        var shotAxis = simd_float3(1, 0, 0)
+        var seenKicks = 0
+        var shakeFrames = 0
+        var prevVelocity: SCNVector3?
+        var lastHitTime: TimeInterval = 0
+        var lastWallContact: TimeInterval = 0
+        var lastDieContact: TimeInterval = 0
+        var lastBounce: [String: TimeInterval] = [:]
+        let jostlePhase = Double.random(in: 0..<(2 * .pi))
+        // Shared with the main thread (guarded by the scene's lock)
+        var queue: [Command] = []
+        var epoch = 0
+        var published = SCNVector3(0, 0, 0.5)
+        var offset = CGPoint.zero
+        init(index: Int) { self.index = index }
     }
 
     // Tuning
     static let gravity: CGFloat = 40
     static let liftZ: CGFloat = 1.7          // die centre while held (bottom face ~1.2 above the table)
     static let ceilingZ: CGFloat = 3.2
+    static let heldSeparation: CGFloat = 1.3   // held dice closer than this are pushed apart
+    static let heldPushGain: CGFloat = 24      // units/s of push per unit of overlap
     static let restitution: CGFloat = 0.45
     static let friction: CGFloat = 0.6
     static let angularDamping: CGFloat = 0.2
@@ -89,10 +131,11 @@ final class DiceScene: NSObject, SCNSceneRendererDelegate, SCNPhysicsContactDele
 
     let scene = SCNScene()
     let cameraNode = SCNNode()
-    let dieNode = SCNNode()            // carries the physics body; never scaled
-    private let dieVisual = SCNNode()  // carries the geometry; scaled for cues and animations
+    let dice: [Die]
+    /// Die 0's node (single-die mode).
+    var dieNode: SCNNode { dice[0].node }
     private let lightNode = SCNNode()
-    private let blobNode: SCNNode?
+    private var nodeIndex: [ObjectIdentifier: Int] = [:]
     let halfW: CGFloat
     let halfH: CGFloat
     let cameraHeight: CGFloat
@@ -100,38 +143,31 @@ final class DiceScene: NSObject, SCNSceneRendererDelegate, SCNPhysicsContactDele
 
     // Shared with the main thread.
     private let lock = NSLock()
-    private var queue: [Command] = []
     private var target = CGPoint.zero
-    private var published = SCNVector3(0, 0, 0.5)
-    private var epochValue = 0
     private var heldScaleTarget: CGFloat = 1
     private var shakeKicks = 0
+    private var wakeChecksValue = false
 
-    // Render-thread state.
-    private var mode = Mode.idle
-    private var quiet: TimeInterval = 0
+    // Render-thread state shared by all dice.
     private var lastTime: TimeInterval?
     private var lastSimTime: TimeInterval?
-    private var rollStart: TimeInterval = 0
-    private var lastPosLog: TimeInterval = 0
-    private var lastBounce: [String: TimeInterval] = [:]
-    private var rollEpoch = 0
-    private var heldScaleAtReturn: CGFloat = 1
-    private var shotAxis = simd_float3(1, 0, 0)
-    private var seenKicks = 0
-    private var shakeFrames = 0
-    private var prevVelocity: SCNVector3?
-    private var lastHitTime: TimeInterval = 0
-    private var lastWallContact: TimeInterval = 0
+    private var lastAnyHit: TimeInterval = 0
+    private var lastOverlapLog: [Int: TimeInterval] = [:]
     private var textureCache: [String: [CGImage]] = [:]
     private(set) var palette = DiePalette.classic
+    /// Pip style for all dice: plain for the single die, constellation for Hot Hand.
+    private(set) var pipStyle = PipStyle.plain
+    /// Hot Hand's special die: always gold, its 1 face is the wild ring. nil outside the game.
+    private(set) var specialDie: Int?
 
-    /// Main-thread callbacks.
-    var onSettled: ((_ face: Int, _ seconds: TimeInterval, _ epoch: Int) -> Void)?
-    var onReturned: ((_ epoch: Int) -> Void)?
-    /// A scripted animation finished (name: "flip", "wobble", "shuffle").
-    var onScriptDone: ((_ name: String, _ epoch: Int) -> Void)?
-    /// A collision worth a sound: kind "wall"/"floor", strength 0...1. Also script sound events.
+    /// Main-thread callbacks. `index` is the die.
+    var onSettled: ((_ index: Int, _ face: Int, _ seconds: TimeInterval, _ epoch: Int) -> Void)?
+    var onReturned: ((_ index: Int, _ epoch: Int) -> Void)?
+    /// A scripted animation finished (name: "flip", "wobble", "shuffle", or a slide's name).
+    var onScriptDone: ((_ index: Int, _ name: String, _ epoch: Int) -> Void)?
+    /// A settled die was knocked moving again (only reported while wake checks are on).
+    var onWoke: ((_ index: Int) -> Void)?
+    /// A collision worth a sound, or a script sound event.
     var onSound: ((_ name: String, _ volume: Float, _ detail: String) -> Void)?
 
     init(halfWidth: CGFloat, halfHeight: CGFloat, blobShadow: Bool) {
@@ -140,92 +176,163 @@ final class DiceScene: NSObject, SCNSceneRendererDelegate, SCNPhysicsContactDele
         useBlobShadow = blobShadow
         let halfFov = Self.fieldOfView / 2 * .pi / 180
         cameraHeight = halfHeight / tan(halfFov)
-        blobNode = blobShadow ? SCNNode() : nil
+        dice = (0..<Self.maxDice).map { Die(index: $0) }
         super.init()
         build()
     }
 
     // MARK: Main-thread API
 
-    var epoch: Int { lock.lock(); defer { lock.unlock() }; return epochValue }
+    /// Die 0's epoch (single-die mode).
+    var epoch: Int { epoch(of: 0) }
+
+    func epoch(of i: Int) -> Int { lock.lock(); defer { lock.unlock() }; return dice[i].epoch }
 
     @discardableResult
-    func send(_ c: Command) -> Int {
+    func send(_ c: Command, to i: Int = 0) -> Int {
         lock.lock(); defer { lock.unlock() }
-        queue.append(c)
-        epochValue += 1
-        return epochValue
+        dice[i].queue.append(c)
+        dice[i].epoch += 1
+        return dice[i].epoch
     }
 
+    /// The cursor target for held dice (each held die adds its own offset).
     func setTarget(_ p: CGPoint) {
         lock.lock(); target = p; lock.unlock()
     }
 
-    /// A shake reversal while held: tumble the die energetically for a moment.
+    func setOffset(_ p: CGPoint, for i: Int) {
+        lock.lock(); dice[i].offset = p; lock.unlock()
+    }
+
+    /// A shake reversal while held: every held die tumbles energetically for a moment.
     func shakeKick() {
         lock.lock(); shakeKicks += 1; lock.unlock()
     }
 
-    // MARK: Looks (main thread; SceneKit property changes are safe here inside a transaction)
-
-    private func textures(for p: DiePalette) -> [CGImage] {
-        if let t = textureCache[p.name] { return t }
-        let t = [1, 2, 6, 5, 3, 4].map { DieArt.texture(value: $0, px: 512, palette: p) }
-        textureCache[p.name] = t
-        return t
+    /// Report settled dice that get knocked moving again (game mode: dice hit each other).
+    var wakeChecks: Bool {
+        get { lock.lock(); defer { lock.unlock() }; return wakeChecksValue }
+        set { lock.lock(); wakeChecksValue = newValue; lock.unlock() }
     }
 
-    func applySkin(_ p: DiePalette) {
-        palette = p
-        let tex = textures(for: p)
-        SCNTransaction.begin()
-        SCNTransaction.disableActions = true
-        for (i, m) in (dieVisual.geometry?.materials ?? []).enumerated() {
-            m.diffuse.contents = tex[i]
-            switch p.name {
-            case "gold":
-                m.specular.contents = NSColor(srgbRed: 1.0, green: 0.86, blue: 0.48, alpha: 1)
-                m.shininess = 0.8
-                m.reflective.contents = DieArt.goldReflection()
-                m.reflective.intensity = 0.55
-                m.fresnelExponent = 1.2
-            case "friday13":
-                // Tight highlight only: a broad one washes the black top face out to grey.
-                m.specular.contents = NSColor(white: 0.2, alpha: 1)
-                m.shininess = 1.0
-                m.reflective.contents = nil
-            default:
-                m.specular.contents = NSColor(white: 0.35, alpha: 1)
-                m.shininess = 0.35
-                m.reflective.contents = nil
-            }
-        }
-        SCNTransaction.commit()
-        dlog("SCENE skin -> \(p.name)")
-    }
-
-    /// The loaded die's wink: the 6 face (material index 2) loses its pips for a moment.
-    func setWink(_ closed: Bool) {
-        guard let m = dieVisual.geometry?.materials[2] else { return }
-        SCNTransaction.begin()
-        SCNTransaction.disableActions = true
-        m.diffuse.contents = closed ? DieArt.texture(value: 6, px: 512, palette: palette, pips: false) : textures(for: palette)[2]
-        SCNTransaction.commit()
-    }
-
-    /// Visual cue while held: < 1 when letting go would put the die away.
+    /// Visual cue while held: < 1 when letting go would put the dice away.
     func setHeldScale(_ s: CGFloat) {
         lock.lock(); heldScaleTarget = s; lock.unlock()
     }
 
-    var publishedPosition: SCNVector3 {
+    /// Die 0's position (single-die mode).
+    var publishedPosition: SCNVector3 { position(of: 0) }
+
+    func position(of i: Int) -> SCNVector3 {
         lock.lock(); defer { lock.unlock() }
-        return published
+        return dice[i].published
     }
 
     func clampXY(_ p: CGPoint, margin: CGFloat = 0.6) -> CGPoint {
         CGPoint(x: min(max(p.x, -halfW + margin), halfW - margin),
                 y: min(max(p.y, -halfH + margin), halfH - margin))
+    }
+
+    /// The face up right now, read from the presentation transform.
+    func faceUpNow(_ i: Int) -> Int { Self.faceUp(dice[i].node.presentation.worldTransform) }
+
+    // MARK: Looks (main thread; SceneKit property changes are safe here inside a transaction)
+
+    private func textures(for p: DiePalette, wild: Bool = false) -> [CGImage] {
+        let key = "\(p.name)-\(pipStyle.rawValue)\(wild ? "-wild" : "")"
+        if let t = textureCache[key] { return t }
+        let t = [1, 2, 6, 5, 3, 4].map { DieArt.texture(value: $0, px: 512, palette: p, style: pipStyle, wild: wild) }
+        textureCache[key] = t
+        return t
+    }
+
+    /// Build the Hot Hand textures ahead of time (launch), so starting a game inside the event
+    /// tap does not draw them there.
+    func warmTextures() {
+        let saved = pipStyle
+        pipStyle = .constellation
+        for p in [DiePalette.classic, .friday13] { _ = textures(for: p) }
+        _ = textures(for: .gold, wild: true)
+        pipStyle = saved
+    }
+
+    /// Make one die the special (gold, wild) die, or none. Re-skins everything.
+    func setSpecialDie(_ i: Int?) {
+        guard i != specialDie else { return }
+        specialDie = i
+        applySkin(palette)
+        dlog("SCENE special die -> \(i.map(String.init) ?? "none")")
+    }
+
+    /// Switch every die between plain and constellation pips (keeps the palette).
+    func setPipStyle(_ style: PipStyle) {
+        guard style != pipStyle else { return }
+        pipStyle = style
+        applySkin(palette)
+        dlog("SCENE pip style -> \(style.rawValue)")
+    }
+
+    func applySkin(_ p: DiePalette) {
+        palette = p
+        SCNTransaction.begin()
+        SCNTransaction.disableActions = true
+        for die in dice {
+            // The special die is gold whatever the table palette (never black or red).
+            let special = die.index == specialDie
+            let dp = special ? DiePalette.gold : p
+            let tex = textures(for: dp, wild: special)
+            for (i, m) in die.materials.enumerated() {
+                m.diffuse.contents = tex[i]
+                switch dp.name {
+                case "gold":
+                    m.specular.contents = NSColor(srgbRed: 1.0, green: 0.86, blue: 0.48, alpha: 1)
+                    m.shininess = 0.8
+                    m.reflective.contents = DieArt.goldReflection()
+                    m.reflective.intensity = 0.55
+                    m.fresnelExponent = 1.2
+                case "friday13":
+                    // Tight highlight only: a broad one washes the black top face out to grey.
+                    m.specular.contents = NSColor(white: 0.2, alpha: 1)
+                    m.shininess = 1.0
+                    m.reflective.contents = nil
+                default:
+                    m.specular.contents = NSColor(white: 0.35, alpha: 1)
+                    m.shininess = 0.35
+                    m.reflective.contents = nil
+                }
+            }
+        }
+        SCNTransaction.commit()
+        dlog("SCENE skin -> \(p.name) (\(pipStyle.rawValue) pips\(specialDie.map { ", die \($0) gold+wild" } ?? ""))")
+    }
+
+    /// The loaded die's wink: die 0's 6 face (material index 2) loses its pips for a moment.
+    func setWink(_ closed: Bool) {
+        let m = dice[0].materials[2]
+        SCNTransaction.begin()
+        SCNTransaction.disableActions = true
+        m.diffuse.contents = closed ? DieArt.texture(value: 6, px: 512, palette: palette, pips: false, style: pipStyle) : textures(for: palette)[2]
+        SCNTransaction.commit()
+    }
+
+    /// A soft warm glow (scoring dice), animated.
+    func setGlow(_ on: Bool, for i: Int) {
+        SCNTransaction.begin()
+        SCNTransaction.animationDuration = on ? 0.18 : 0.45
+        for m in dice[i].materials {
+            m.emission.contents = on ? NSColor(srgbRed: 1.0, green: 0.78, blue: 0.42, alpha: 1) : NSColor.black
+            m.emission.intensity = on ? 0.38 : 0
+        }
+        SCNTransaction.commit()
+    }
+
+    /// Dim a die a little (bust slump): 1 = normal, smaller = darker. Animated.
+    func setDim(_ level: CGFloat, for i: Int) {
+        SCNTransaction.begin()
+        SCNTransaction.animationDuration = 0.35
+        for m in dice[i].materials { m.multiply.contents = NSColor(white: level, alpha: 1) }
+        SCNTransaction.commit()
     }
 
     // MARK: Build
@@ -246,7 +353,7 @@ final class DiceScene: NSObject, SCNSceneRendererDelegate, SCNPhysicsContactDele
         cameraNode.position = SCNVector3(0, 0, cameraHeight)
         scene.rootNode.addChildNode(cameraNode)
 
-        // Lights: ambient fill, shadow-casting key that follows the die (tight shadow frustum),
+        // Lights: ambient fill, shadow-casting key that follows die 0 (tight shadow frustum),
         // and a soft omni from near the camera for the specular glint.
         let ambient = SCNNode()
         ambient.light = SCNLight()
@@ -279,29 +386,52 @@ final class DiceScene: NSObject, SCNSceneRendererDelegate, SCNPhysicsContactDele
         glint.position = SCNVector3(-halfW * 0.3, halfH * 0.4, cameraHeight * 0.6)
         scene.rootNode.addChildNode(glint)
 
-        // Die: chamfered box, six DieArt textures. SCNBox material order (verified empirically):
-        // +z, +x, -z, -x, +y, -y. Values: +z=1 -z=6, +x=2 -x=5, +y=3 -y=4 (opposites sum to 7).
-        let box = SCNBox(width: 1, height: 1, length: 1, chamferRadius: 0.12)
-        box.chamferSegmentCount = 6
-        box.materials = [1, 2, 6, 5, 3, 4].map { v in
-            let m = SCNMaterial()
-            m.lightingModel = .blinn
-            m.diffuse.contents = DieArt.texture(value: v, px: 512)
-            m.diffuse.mipFilter = .linear
-            m.specular.contents = NSColor(white: 0.35, alpha: 1)
-            m.shininess = 0.35
-            return m
+        // Dice: chamfered boxes, six DieArt textures each. SCNBox material order (verified
+        // empirically): +z, +x, -z, -x, +y, -y. Values: +z=1 -z=6, +x=2 -x=5, +y=3 -y=4.
+        // Each die has its own geometry and materials (so one can glow or dim alone).
+        for die in dice {
+            let box = SCNBox(width: 1, height: 1, length: 1, chamferRadius: 0.12)
+            box.chamferSegmentCount = 6
+            box.materials = [1, 2, 6, 5, 3, 4].map { v in
+                let m = SCNMaterial()
+                m.lightingModel = .blinn
+                m.diffuse.contents = DieArt.texture(value: v, px: 512)
+                m.diffuse.mipFilter = .linear
+                m.specular.contents = NSColor(white: 0.35, alpha: 1)
+                m.shininess = 0.35
+                return m
+            }
+            die.materials = box.materials
+            // Geometry lives on a child node. Only the child is ever scaled (drop-zone cue,
+            // return animations): scaling a node that carries a dynamic physics body makes
+            // SceneKit push the node's stale model transform into the body (a teleport).
+            die.visual.geometry = box
+            die.visual.castsShadow = true
+            die.node.addChildNode(die.visual)
+            die.node.name = "die \(die.index)"
+            die.node.isHidden = true
+            die.node.position = SCNVector3(0, 0, 0.5)
+            scene.rootNode.addChildNode(die.node)
+            nodeIndex[ObjectIdentifier(die.node)] = die.index
+            // Only die 0 has a body at start; game dice get theirs when placed.
+            if die.index == 0 { die.node.physicsBody = makeBody() }
+            if useBlobShadow {
+                let blob = SCNNode()
+                let plane = SCNPlane(width: 1.5, height: 1.5)
+                let m = SCNMaterial()
+                m.lightingModel = .constant
+                m.diffuse.contents = DieArt.blobShadow(px: 256)
+                m.writesToDepthBuffer = false
+                m.isDoubleSided = false
+                plane.materials = [m]
+                blob.geometry = plane
+                blob.castsShadow = false
+                blob.isHidden = true
+                blob.renderingOrder = -1
+                scene.rootNode.addChildNode(blob)
+                die.blob = blob
+            }
         }
-        // Geometry lives on a child node. Only the child is ever scaled (drop-zone cue, return
-        // animations): scaling a node that carries a dynamic physics body makes SceneKit push the
-        // node's stale model transform into the body, which teleported the held die.
-        dieVisual.geometry = box
-        dieVisual.castsShadow = true
-        dieNode.addChildNode(dieVisual)
-        dieNode.isHidden = true
-        dieNode.position = SCNVector3(0, 0, 0.5)
-        scene.rootNode.addChildNode(dieNode)
-        dieNode.physicsBody = makeBody()
 
         // Floor: a static slab whose top is z = 0, plus a visual plane that only shows the shadow.
         let floorShape = SCNBox(width: halfW * 2 + 8, height: halfH * 2 + 8, length: 4, chamferRadius: 0)
@@ -311,20 +441,7 @@ final class DiceScene: NSObject, SCNSceneRendererDelegate, SCNPhysicsContactDele
                                            restitution: 0.6, friction: 0.8, category: Self.catFloor)
         scene.rootNode.addChildNode(floorBody)
 
-        if let blob = blobNode {
-            let plane = SCNPlane(width: 1.5, height: 1.5)
-            let m = SCNMaterial()
-            m.lightingModel = .constant
-            m.diffuse.contents = DieArt.blobShadow(px: 256)
-            m.writesToDepthBuffer = false
-            m.isDoubleSided = false
-            plane.materials = [m]
-            blob.geometry = plane
-            blob.castsShadow = false
-            blob.isHidden = true
-            blob.renderingOrder = -1
-            scene.rootNode.addChildNode(blob)
-        } else {
+        if !useBlobShadow {
             let plane = SCNPlane(width: halfW * 2 + 2, height: halfH * 2 + 2)
             let m = SCNMaterial()
             m.lightingModel = .shadowOnly
@@ -364,9 +481,22 @@ final class DiceScene: NSObject, SCNSceneRendererDelegate, SCNPhysicsContactDele
         b.damping = Self.linearDamping
         b.continuousCollisionDetectionThreshold = 0.3
         b.categoryBitMask = Self.catDie
-        b.collisionBitMask = Self.catWall | Self.catFloor
-        b.contactTestBitMask = Self.catWall
+        b.collisionBitMask = Self.catWall | Self.catFloor | Self.catDie
+        b.contactTestBitMask = Self.catWall | Self.catDie
         b.allowsResting = true
+        return b
+    }
+
+    /// Body for a kept die sitting in the row: static, die-sized (at its kept scale), and in
+    /// the die category, so thrown dice knock against it and it counts as a die-on-die hit.
+    private func parkedBody(scale: CGFloat) -> SCNPhysicsBody {
+        let s = max(0.5, scale)
+        let shape = SCNPhysicsShape(geometry: SCNBox(width: s, height: s, length: s, chamferRadius: 0), options: nil)
+        let b = SCNPhysicsBody(type: .static, shape: shape)
+        b.restitution = Self.restitution
+        b.friction = Self.friction
+        b.categoryBitMask = Self.catDie
+        b.collisionBitMask = Self.catDie
         return b
     }
 
@@ -434,61 +564,87 @@ final class DiceScene: NSObject, SCNSceneRendererDelegate, SCNPhysicsContactDele
         lastTime = time
 
         lock.lock()
-        let commands = queue
-        queue.removeAll()
+        let work: [(Die, [Command], Int, CGPoint)] = dice.map { d in
+            let c = d.queue
+            d.queue.removeAll()
+            return (d, c, d.epoch, d.offset)
+        }
         let tgt = target
-        let ep = epochValue
         let cue = heldScaleTarget
         let kicks = shakeKicks
         lock.unlock()
 
-        for c in commands { apply(c, time: time, epoch: ep) }
+        for (die, commands, ep, offset) in work {
+            for c in commands { apply(c, to: die, time: time, epoch: ep) }
+            update(die, time: time, dt: dt, epoch: ep, target: tgt, offset: offset, cue: cue, kicks: kicks)
+        }
+    }
 
-        switch mode {
+    private func update(_ die: Die, time: TimeInterval, dt: TimeInterval, epoch ep: Int,
+                        target tgt: CGPoint, offset: CGPoint, cue: CGFloat, kicks: Int) {
+        let node = die.node, visual = die.visual
+        switch die.mode {
         case .held:
-            guard let body = dieNode.physicsBody else { break }
-            let p = dieNode.presentation.position
-            let goal = SCNVector3(tgt.x, tgt.y, Self.liftZ)
+            guard let body = node.physicsBody else { break }
+            let p = node.presentation.position
+            // Each die in a handful sits on its own offset, wandering a little so they jostle.
+            var jx: CGFloat = 0, jy: CGFloat = 0
+            if offset != .zero {
+                jx = 0.18 * CGFloat(sin(time * 3.3 + die.jostlePhase))
+                jy = 0.18 * CGFloat(cos(time * 2.7 + die.jostlePhase * 1.7))
+            }
+            let goal = SCNVector3(tgt.x + offset.x + jx, tgt.y + offset.y + jy, Self.liftZ)
             let (v, w) = ThrowController.heldStep(position: p, target: goal,
                                                   angular: angularVector(body.angularVelocity), dt: dt)
-            body.velocity = v
-            if kicks != seenKicks {
-                seenKicks = kicks
-                shakeFrames = 24
+            // The follow sets velocity outright, which cancels the solver's own separation, so
+            // a handful would sink into itself. Push held neighbours apart here instead.
+            var push = SCNVector3(0, 0, 0)
+            for other in dice where other.index != die.index && !other.node.isHidden {
+                guard case .held = other.mode else { continue }
+                let d = p - other.node.presentation.position
+                let len = d.length
+                if len < Self.heldSeparation, len > 0.001 {
+                    push = push + d * ((Self.heldSeparation - len) / len * Self.heldPushGain)
+                }
+            }
+            body.velocity = SCNVector3(v.x + push.x, v.y + push.y, v.z)
+            if kicks != die.seenKicks {
+                die.seenKicks = kicks
+                die.shakeFrames = 24
                 body.angularVelocity = axisAngle(ThrowController.randomSpin(CGFloat.random(in: 26...36)))
-            } else if shakeFrames > 0 {
-                shakeFrames -= 1          // keep tumbling freely while shaking
+            } else if die.shakeFrames > 0 {
+                die.shakeFrames -= 1          // keep tumbling freely while shaking
             } else {
                 body.angularVelocity = axisAngle(w)
             }
-            let cur = dieVisual.scale.x
+            let cur = visual.scale.x
             if abs(cur - cue) > 0.002 {
                 let n = cur + (cue - cur) * min(1, CGFloat(dt) * 14)
-                dieVisual.scale = SCNVector3(n, n, n)
+                visual.scale = SCNVector3(n, n, n)
             }
         case .rolling:
-            if dieVisual.scale.x < 0.999 {
-                let n = dieVisual.scale.x + (1 - dieVisual.scale.x) * min(1, CGFloat(dt) * 14)
-                dieVisual.scale = SCNVector3(n, n, n)
+            if visual.scale.x < 0.999 {
+                let n = visual.scale.x + (1 - visual.scale.x) * min(1, CGFloat(dt) * 14)
+                visual.scale = SCNVector3(n, n, n)
             }
             // Long-roll safety: after 6 s, bleed energy so it always settles.
-            if time - rollStart > 6, let body = dieNode.physicsBody {
+            if time - die.rollStart > 6, let body = node.physicsBody {
                 body.velocity = body.velocity * 0.9
                 body.angularVelocity = axisAngle(angularVector(body.angularVelocity) * 0.9)
             }
         case let .returning(from, to, start, duration, style):
             let s = start ?? time
-            if start == nil { mode = .returning(from: from, to: to, start: s, duration: duration, style: style) }
+            if start == nil { die.mode = .returning(from: from, to: to, start: s, duration: duration, style: style) }
             let k = min(1, (time - s) / duration)
             if style == .trash {
                 // Twist and crumple into the Trash.
                 let kk = CGFloat(k)
                 let e = kk * kk * (3 - 2 * kk)
-                dieNode.position = from + (to - from) * e
-                let sc = max(0.04, (1 - 0.96 * e) * heldScaleAtReturn)
+                node.position = from + (to - from) * e
+                let sc = max(0.04, (1 - 0.96 * e) * die.heldScaleAtReturn)
                 let wob = 0.18 * sin(CGFloat(time - s) * 45) * (1 - kk)
-                dieVisual.scale = SCNVector3(sc * (1 + wob), sc * (1 - wob), sc)
-                dieNode.simdOrientation = simd_quatf(angle: Float(22 * dt), axis: simd_float3(0, 0, 1)) * dieNode.simdOrientation
+                visual.scale = SCNVector3(sc * (1 + wob), sc * (1 - wob), sc)
+                node.simdOrientation = simd_quatf(angle: Float(22 * dt), axis: simd_float3(0, 0, 1)) * node.simdOrientation
             } else if style == .shot {
                 // Accelerating (ease-in), a small hop toward the viewer mid-flight, tumbling
                 // forward faster and faster, and shrinking mostly at the end.
@@ -496,132 +652,152 @@ final class DiceScene: NSObject, SCNSceneRendererDelegate, SCNPhysicsContactDele
                 let e = kk * kk
                 var p = from + (to - from) * e
                 p.z += 0.9 * sin(.pi * kk)
-                dieNode.position = p
-                let sc = 1 - 0.85 * kk * kk * kk
-                dieVisual.scale = SCNVector3(sc, sc, sc)
+                node.position = p
+                let sc = (1 - 0.85 * kk * kk * kk) * die.heldScaleAtReturn
+                visual.scale = SCNVector3(sc, sc, sc)
                 let omega = Float(16 + 34 * kk)              // rad/s
-                dieNode.simdOrientation = simd_quatf(angle: omega * Float(dt), axis: shotAxis) * dieNode.simdOrientation
+                node.simdOrientation = simd_quatf(angle: omega * Float(dt), axis: die.shotAxis) * node.simdOrientation
             } else {
                 let e = CGFloat(k * k * (3 - 2 * k))
-                dieNode.position = from + (to - from) * e
-                let sc = (1 - 0.85 * e) * heldScaleAtReturn
-                dieVisual.scale = SCNVector3(sc, sc, sc)
+                node.position = from + (to - from) * e
+                let sc = (1 - 0.85 * e) * die.heldScaleAtReturn
+                visual.scale = SCNVector3(sc, sc, sc)
             }
             if k >= 1 {
-                dieNode.isHidden = true
-                blobNode?.isHidden = true
-                mode = .idle
-                let ep2 = ep
-                DispatchQueue.main.async { [weak self] in self?.onReturned?(ep2) }
+                node.isHidden = true
+                die.blob?.isHidden = true
+                die.mode = .idle
+                let i = die.index
+                DispatchQueue.main.async { [weak self] in self?.onReturned?(i, ep) }
             }
         case let .scripted(script):
             let s = script.start ?? time
             if script.start == nil { script.start = s }
             let k = min(1, (time - s) / script.duration)
-            script.step(dieNode, k)
+            script.step(node, k)
             while let ev = script.events.first, ev.k <= k {
                 script.events.removeFirst()
-                emitSound(ev.sound, ev.volume, "\(script.name) event")
+                emitSound(ev.sound, ev.volume, "\(script.name) event (die \(die.index))")
             }
             if k >= 1 {
-                dieNode.physicsBody = makeBody()
-                dieNode.physicsBody!.resetTransform()
-                dieNode.physicsBody!.velocity = SCNVector3(0, 0, 0)
-                dieNode.physicsBody!.angularVelocity = SCNVector4(0, 0, 1, 0)
-                mode = .idle
-                let name = script.name, ep2 = ep
-                dlog("SCENE script \(name) done at \(dieNode.position.short)")
-                DispatchQueue.main.async { [weak self] in self?.onScriptDone?(name, ep2) }
+                if script.park {
+                    // A kept die is a solid, immovable obstacle: live dice bounce off the row.
+                    node.physicsBody = parkedBody(scale: die.visual.scale.x)
+                    node.physicsBody!.resetTransform()
+                    die.mode = .parked
+                } else {
+                    node.physicsBody = makeBody()
+                    node.physicsBody!.resetTransform()
+                    node.physicsBody!.velocity = SCNVector3(0, 0, 0)
+                    node.physicsBody!.angularVelocity = SCNVector4(0, 0, 1, 0)
+                    die.mode = .idle
+                }
+                let name = script.name, i = die.index
+                dlog("SCENE die \(i) script \(name) done at \(node.position.short)\(script.park ? " (parked)" : "")")
+                DispatchQueue.main.async { [weak self] in self?.onScriptDone?(i, name, ep) }
             }
-        case .idle:
+        case .idle, .parked:
             break
         }
     }
 
-    private func apply(_ c: Command, time: TimeInterval, epoch: Int) {
+    private func apply(_ c: Command, to die: Die, time: TimeInterval, epoch: Int) {
+        let node = die.node
         switch c {
         case let .place(position, orientation, velocity, angular, held):
-            if dieNode.physicsBody == nil { dieNode.physicsBody = makeBody() }
-            dieVisual.scale = SCNVector3(1, 1, 1)
-            dieNode.position = position
-            if let q = orientation { dieNode.orientation = q }
-            dieNode.isHidden = false
-            blobNode?.isHidden = false
-            dieNode.physicsBody!.resetTransform()
-            dieNode.physicsBody!.velocity = velocity
-            dieNode.physicsBody!.angularVelocity = angular
-            mode = held ? .held : .rolling
-            quiet = 0
-            prevVelocity = nil
-            rollStart = time
-            rollEpoch = epoch
-            dlog("SCENE place at \(position.short) v=\(velocity.short) |w|=\(String(format: "%.1f", angular.w)) mode=\(held ? "held" : "rolling")")
+            // A parked die carries a static body; anything not dynamic is replaced.
+            if node.physicsBody?.type != .dynamic { node.physicsBody = makeBody() }
+            die.visual.scale = SCNVector3(1, 1, 1)
+            node.position = position
+            if let q = orientation { node.orientation = q }
+            node.isHidden = false
+            die.blob?.isHidden = false
+            node.physicsBody!.resetTransform()
+            node.physicsBody!.velocity = velocity
+            node.physicsBody!.angularVelocity = angular
+            die.mode = held ? .held : .rolling
+            die.quiet = 0
+            die.prevVelocity = nil
+            die.rollStart = time
+            die.rollEpoch = epoch
+            dlog("SCENE die \(die.index) place at \(position.short) v=\(velocity.short) |w|=\(String(format: "%.1f", angular.w)) mode=\(held ? "held" : "rolling")")
         case .hold:
-            if dieNode.physicsBody == nil { dieNode.physicsBody = makeBody() }
-            mode = .held
-            quiet = 0
-            dlog("SCENE hold from \(dieNode.presentation.position.short)")
+            if node.physicsBody?.type != .dynamic {
+                let p = node.presentation.position
+                node.position = p
+                node.physicsBody = makeBody()
+                node.physicsBody!.resetTransform()
+            }
+            die.mode = .held
+            die.quiet = 0
+            dlog("SCENE die \(die.index) hold from \(node.presentation.position.short)")
         case let .release(velocity, angular):
-            guard let body = dieNode.physicsBody else { break }
+            guard let body = node.physicsBody else { break }
             body.velocity = velocity
             body.angularVelocity = angular
-            mode = .rolling
-            quiet = 0
-            prevVelocity = nil
-            rollStart = time
-            rollEpoch = epoch
-            dlog("SCENE release from \(dieNode.presentation.position.short) v=\(velocity.short) |w|=\(String(format: "%.1f", angular.w))")
+            die.mode = .rolling
+            die.quiet = 0
+            die.prevVelocity = nil
+            die.rollStart = time
+            die.rollEpoch = epoch
+            dlog("SCENE die \(die.index) release from \(node.presentation.position.short) v=\(velocity.short) |w|=\(String(format: "%.1f", angular.w))")
         case let .returnTo(to, duration, style):
-            let from = dieNode.presentation.position
-            let q = dieNode.presentation.orientation
-            heldScaleAtReturn = dieVisual.presentation.scale.x
-            dieNode.physicsBody = nil       // no physics while it flies into the tile
-            dieNode.position = from
-            dieNode.orientation = q
+            let from = node.presentation.position
+            let q = node.presentation.orientation
+            die.heldScaleAtReturn = die.visual.presentation.scale.x
+            node.physicsBody = nil       // no physics while it flies into the tile
+            node.position = from
+            node.orientation = q
             let d = to - from
             let axis = simd_float3(Float(-d.y), Float(d.x), 0)    // ẑ × direction: tumble toward the Dock
-            shotAxis = simd_length(axis) > 1e-4 ? simd_normalize(axis) : simd_float3(1, 0, 0)
-            mode = .returning(from: from, to: to, start: nil, duration: duration, style: style)
-            dlog(String(format: "SCENE return (%@) from %@ to %@ over %.2f s", style.rawValue, from.short, to.short, duration))
+            die.shotAxis = simd_length(axis) > 1e-4 ? simd_normalize(axis) : simd_float3(1, 0, 0)
+            die.mode = .returning(from: from, to: to, start: nil, duration: duration, style: style)
+            dlog(String(format: "SCENE die %d return (%@) from %@ to %@ over %.2f s", die.index, style.rawValue, from.short, to.short, duration))
         case .hideNow:
-            dieNode.physicsBody = nil
-            dieNode.isHidden = true
-            blobNode?.isHidden = true
-            mode = .idle
-        case let .flipToSix(label):
-            startScript(makeFlipToSix(), "flip onto 6 (\(label))")
+            node.physicsBody = nil
+            node.isHidden = true
+            die.blob?.isHidden = true
+            die.visual.scale = SCNVector3(1, 1, 1)
+            die.mode = .idle
+        case let .flipTo(face, label):
+            startScript(makeFlip(die, to: face), on: die, "flip onto \(face) (\(label))")
         case .wobble:
-            startScript(makeWobble(), "bored wobble")
+            startScript(makeWobble(die), on: die, "bored wobble")
         case let .shuffleHome(to):
-            startScript(makeShuffle(to: to), "bored shuffle toward \(String(format: "(%.1f, %.1f)", to.x, to.y))")
+            startScript(makeShuffle(die, to: to), on: die, "shuffle toward \(String(format: "(%.1f, %.1f)", to.x, to.y))")
+        case let .slide(to, face, scale, duration, park, name):
+            let s = makeSlide(die, to: to, face: face, scale: scale, duration: duration, name: name)
+            s.park = park
+            startScript(s, on: die, "slide to \(to.short)\(park ? ", park" : "")", keepScale: true)
         }
     }
 
     // MARK: Scripted animations (render thread)
 
-    private func startScript(_ script: Script, _ label: String) {
-        let p = dieNode.presentation.position
-        let q = dieNode.presentation.simdOrientation
-        dieNode.physicsBody = nil
-        dieNode.position = p
-        dieNode.simdOrientation = q
-        dieVisual.scale = SCNVector3(1, 1, 1)
-        dieNode.isHidden = false
-        blobNode?.isHidden = false
-        mode = .scripted(script)
-        dlog(String(format: "SCENE script %@ (%@) from %@ over %.2f s", script.name, label, p.short, script.duration))
+    private func startScript(_ script: Script, on die: Die, _ label: String, keepScale: Bool = false) {
+        let node = die.node
+        let p = node.presentation.position
+        let q = node.presentation.simdOrientation
+        node.physicsBody = nil
+        node.position = p
+        node.simdOrientation = q
+        if !keepScale { die.visual.scale = SCNVector3(1, 1, 1) }
+        node.isHidden = false
+        die.blob?.isHidden = false
+        die.mode = .scripted(script)
+        dlog(String(format: "SCENE die %d script %@ (%@) from %@ over %.2f s", die.index, script.name, label, p.short, script.duration))
     }
 
     private static func quat(_ q: SCNQuaternion) -> simd_quatf {
         simd_quatf(ix: Float(q.x), iy: Float(q.y), iz: Float(q.z), r: Float(q.w))
     }
 
-    /// Hop straight up, turn onto 6 (keeping a random yaw), land.
-    private func makeFlipToSix() -> Script {
-        let p0 = dieNode.presentation.position
-        let q0 = dieNode.presentation.simdOrientation
+    /// Hop straight up, turn onto `face` (keeping a random yaw), land.
+    private func makeFlip(_ die: Die, to face: Int) -> Script {
+        let p0 = die.node.presentation.position
+        let q0 = die.node.presentation.simdOrientation
         let yaw = simd_quatf(angle: Float.random(in: 0..<(2 * .pi)), axis: simd_float3(0, 0, 1))
-        let q1 = yaw * Self.quat(Self.orientation(faceUp: 6))
+        let q1 = yaw * Self.quat(Self.orientation(faceUp: face))
         return Script("flip", duration: 0.55, events: [(k: 1.0, sound: "tokFloor", volume: 0.8)]) { node, k in
             let kk = CGFloat(k)
             node.position = SCNVector3(p0.x, p0.y, 0.5 + 1.3 * sin(.pi * kk))
@@ -631,9 +807,9 @@ final class DiceScene: NSObject, SCNSceneRendererDelegate, SCNPhysicsContactDele
     }
 
     /// Rock a little about a random horizontal axis and settle back exactly.
-    private func makeWobble() -> Script {
-        let p0 = dieNode.presentation.position
-        let q0 = dieNode.presentation.simdOrientation
+    private func makeWobble(_ die: Die) -> Script {
+        let p0 = die.node.presentation.position
+        let q0 = die.node.presentation.simdOrientation
         let a = Float.random(in: 0..<(2 * .pi))
         let axis = simd_float3(cos(a), sin(a), 0)
         return Script("wobble", duration: 0.8, events: [(k: 0.35, sound: "tokFloor", volume: 0.35), (k: 0.95, sound: "tokFloor", volume: 0.3)]) { node, k in
@@ -644,9 +820,9 @@ final class DiceScene: NSObject, SCNSceneRendererDelegate, SCNPhysicsContactDele
     }
 
     /// Small rolling hops (a quarter turn each) toward the target, stopping at the table edge.
-    private func makeShuffle(to target: CGPoint) -> Script {
-        let p0 = dieNode.presentation.position
-        let q0 = dieNode.presentation.simdOrientation
+    private func makeShuffle(_ die: Die, to target: CGPoint) -> Script {
+        let p0 = die.node.presentation.position
+        let q0 = die.node.presentation.simdOrientation
         let t = clampXY(target, margin: 0.6)
         let d = CGVector(dx: t.x - p0.x, dy: t.y - p0.y)
         let dist = max(0.01, hypot(d.dx, d.dy))
@@ -667,97 +843,173 @@ final class DiceScene: NSObject, SCNSceneRendererDelegate, SCNPhysicsContactDele
         }
     }
 
+    /// Glide (with a small lift) to a spot, turning square to the viewer if a face is given.
+    private func makeSlide(_ die: Die, to: SCNVector3, face: Int?, scale: CGFloat, duration: TimeInterval, name: String) -> Script {
+        let p0 = die.node.presentation.position
+        let q0 = die.node.presentation.simdOrientation
+        let q1 = face.map { Self.quat(Self.orientation(faceUp: $0)) } ?? q0
+        let s0 = die.visual.presentation.scale.x
+        let visual = die.visual
+        return Script(name, duration: duration) { node, k in
+            let e = CGFloat(k * k * (3 - 2 * k))
+            var p = p0 + (to - p0) * e
+            p.z += 0.5 * sin(.pi * CGFloat(k))
+            node.position = p
+            node.simdOrientation = simd_slerp(q0, q1, Float(e))
+            let sc = s0 + (scale - s0) * e
+            visual.scale = SCNVector3(sc, sc, sc)
+        }
+    }
+
     private func emitSound(_ name: String, _ volume: Float, _ detail: String) {
         DispatchQueue.main.async { [weak self] in self?.onSound?(name, volume, detail) }
     }
 
     func renderer(_ renderer: SCNSceneRenderer, didSimulatePhysicsAtTime time: TimeInterval) {
-        var p = dieNode.presentation.position
+        let dt = lastSimTime.map { min(max(time - $0, 0), 0.05) } ?? (1.0 / 60.0)
+        lastSimTime = time
+        lock.lock()
+        let wakes = wakeChecksValue
+        lock.unlock()
+        var lightSet = false
+        for die in dice {
+            simulate(die, time: time, dt: dt, wakes: wakes)
+            if !lightSet, !useBlobShadow, !die.node.isHidden {
+                aimLight(at: die.node.presentation.position)
+                lightSet = true
+            }
+        }
+        if isDebug { logOverlaps(time) }
+    }
+
+    /// Debug only: report dice whose bodies are interpenetrating, so a real pass-through
+    /// shows up in the log.
+    private func logOverlaps(_ time: TimeInterval) {
+        for a in dice where a.node.physicsBody != nil && !a.node.isHidden {
+            for b in dice where b.index > a.index && b.node.physicsBody != nil && !b.node.isHidden {
+                let d = (a.node.presentation.position - b.node.presentation.position).length
+                // Each cube contains a ball of half its size, so centres closer than the mean
+                // size mean the cubes intersect. 0.94 leaves room for solver slop.
+                let limit = 0.94 * (a.visual.scale.x + b.visual.scale.x) / 2
+                let key = a.index * 16 + b.index
+                if d < limit, time - (lastOverlapLog[key] ?? 0) > 0.25 {
+                    lastOverlapLog[key] = time
+                    var held = false
+                    if case .held = a.mode, case .held = b.mode { held = true }
+                    dlog(String(format: "SCENE OVERLAP die %d / die %d centres %.2f apart (limit %.2f)%@", a.index, b.index, d, limit,
+                                held ? " in the held handful" : ""))
+                }
+            }
+        }
+    }
+
+    private func simulate(_ die: Die, time: TimeInterval, dt: TimeInterval, wakes: Bool) {
+        let node = die.node
+        var p = node.presentation.position
 
         // Safety net: never let it leave the table volume.
-        if case .returning = mode {} else if !dieNode.isHidden, let body = dieNode.physicsBody {
+        if case .returning = die.mode {} else if !node.isHidden, let body = node.physicsBody {
             let c = clampXY(CGPoint(x: p.x, y: p.y), margin: 0.5)
             let zOK = p.z > 0.2 && p.z < Self.ceilingZ
             if abs(c.x - p.x) > 0.25 || abs(c.y - p.y) > 0.25 || !zOK {
                 let fixed = SCNVector3(c.x, c.y, min(max(p.z, 0.6), Self.liftZ))
-                dlog("SCENE out of bounds at \(p.short); put back at \(fixed.short)")
-                dieNode.position = fixed
+                dlog("SCENE die \(die.index) out of bounds at \(p.short); put back at \(fixed.short)")
+                node.position = fixed
                 body.resetTransform()
                 body.velocity = SCNVector3(0, 0, 0)
                 p = fixed
             }
         }
 
-        lock.lock(); published = p; lock.unlock()
-        let dt = lastSimTime.map { min(max(time - $0, 0), 0.05) } ?? (1.0 / 60.0)
-        lastSimTime = time
+        lock.lock(); die.published = p; lock.unlock()
 
-        if !dieNode.isHidden {
-            if let blob = blobNode {
-                let hgt = max(0, p.z - 0.5)
-                let s = 1 + 0.45 * hgt
-                blob.scale = SCNVector3(s, s, 1)
-                blob.position = SCNVector3(p.x + 0.1 + 0.12 * hgt, p.y - 0.12 - 0.15 * hgt, 0.002)
-                blob.opacity = max(0.25, 0.85 - 0.3 * hgt)
-            } else {
-                aimLight(at: p)
-            }
+        if !node.isHidden, let blob = die.blob {
+            let hgt = max(0, p.z - 0.5)
+            let s = 1 + 0.45 * hgt
+            blob.scale = SCNVector3(s, s, 1)
+            blob.position = SCNVector3(p.x + 0.1 + 0.12 * hgt, p.y - 0.12 - 0.15 * hgt, 0.002)
+            blob.opacity = max(0.25, 0.85 - 0.3 * hgt)
         }
 
-        guard case .rolling = mode, let body = dieNode.physicsBody else { return }
-        if time - lastPosLog > 0.25 {
-            lastPosLog = time
-            dlog(String(format: "SCENE rolling t=%.2f pos=%@ |v|=%.2f |w|=%.2f",
-                        time - rollStart, p.short, body.velocity.length, abs(body.angularVelocity.w)))
+        // Game mode: a settled die knocked by another one starts rolling again.
+        if wakes, case .idle = die.mode, !node.isHidden, let body = node.physicsBody,
+           body.velocity.length > 0.6 || abs(body.angularVelocity.w) > 1.5 {
+            die.mode = .rolling
+            die.quiet = 0
+            die.prevVelocity = nil
+            let i = die.index
+            dlog("SCENE die \(i) knocked moving again at \(p.short)")
+            DispatchQueue.main.async { [weak self] in self?.onWoke?(i) }
+        }
+
+        guard case .rolling = die.mode, let body = node.physicsBody else { return }
+        if time - die.lastPosLog > 0.25 {
+            die.lastPosLog = time
+            dlog(String(format: "SCENE die %d rolling t=%.2f pos=%@ |v|=%.2f |w|=%.2f",
+                        die.index, time - die.rollStart, p.short, body.velocity.length, abs(body.angularVelocity.w)))
         }
         // Hit strength from the change in velocity beyond what gravity explains (SceneKit's
         // contact impulse reads 0). Thresholded and rate-limited so settling does not buzz.
         let vel = body.velocity
-        if let pv = prevVelocity {
+        if let pv = die.prevVelocity {
             let expected = SCNVector3(pv.x, pv.y, pv.z - Self.gravity * CGFloat(dt))
             let dv = (vel - expected).length
             let now = ProcessInfo.processInfo.systemUptime
-            if dv > 2.0, now - lastHitTime > 0.045, !(vel.length < 0.6 && dv < 3.5) {
-                lastHitTime = now
-                let wall = now - lastWallContact < 0.06
+            if dv > 2.0, now - die.lastHitTime > 0.045, now - lastAnyHit > 0.025, !(vel.length < 0.6 && dv < 3.5) {
+                die.lastHitTime = now
+                lastAnyHit = now
+                let wall = now - die.lastWallContact < 0.06
+                let other = now - die.lastDieContact < 0.06
                 // Small dynamic range: a hard hit is only a little louder than a gentle one.
                 let strength = Float(min(1, max(0, (dv - 2.0) / 18.0)))
-                let vol = 0.55 + 0.45 * strength.squareRoot()
-                emitSound(wall ? "tokWall" : "tokFloor", vol, String(format: "%@ hit dv=%.1f", wall ? "wall" : "floor", dv))
+                var vol = 0.55 + 0.45 * strength.squareRoot()
+                if other { vol *= 0.8 }
+                let kind = other ? "die" : (wall ? "wall" : "floor")
+                emitSound(wall || other ? "tokWall" : "tokFloor", vol, String(format: "die %d %@ hit dv=%.1f", die.index, kind, dv))
             }
         }
-        prevVelocity = vel
+        die.prevVelocity = vel
         let v = body.velocity.length
         let w = abs(body.angularVelocity.w)
         if body.isResting || (v < Self.restLinear && w < Self.restAngular && p.z < 0.75) {
-            quiet += dt
+            die.quiet += dt
         } else {
-            quiet = 0
+            die.quiet = 0
         }
-        if quiet >= Self.restHold || body.isResting {
-            let face = Self.faceUp(dieNode.presentation.worldTransform)
-            let secs = time - rollStart
-            let ep = rollEpoch
-            mode = .idle
+        if die.quiet >= Self.restHold || body.isResting {
+            let face = Self.faceUp(node.presentation.worldTransform)
+            let secs = time - die.rollStart
+            let ep = die.rollEpoch
+            die.mode = .idle
             body.velocity = SCNVector3(0, 0, 0)
             body.angularVelocity = SCNVector4(0, 0, 1, 0)
-            dlog(String(format: "SCENE settled: face %d up after %.2f s at %@ (resting=%@)",
-                        face, secs, p.short, body.isResting ? "yes" : "no"))
-            DispatchQueue.main.async { [weak self] in self?.onSettled?(face, secs, ep) }
+            dlog(String(format: "SCENE die %d settled: face %d up after %.2f s at %@ (resting=%@)",
+                        die.index, face, secs, p.short, body.isResting ? "yes" : "no"))
+            let i = die.index
+            DispatchQueue.main.async { [weak self] in self?.onSettled?(i, face, secs, ep) }
         }
     }
 
     func physicsWorld(_ world: SCNPhysicsWorld, didBegin contact: SCNPhysicsContact) {
-        let other = contact.nodeA === dieNode ? contact.nodeB : contact.nodeA
-        guard let name = other.name else { return }
+        let ia = nodeIndex[ObjectIdentifier(contact.nodeA)]
+        let ib = nodeIndex[ObjectIdentifier(contact.nodeB)]
         let now = ProcessInfo.processInfo.systemUptime
+        if let a = ia, let b = ib {
+            // Die against die: mark both for the hit sound; only rolling dice count.
+            for i in [a, b] { if case .rolling = dice[i].mode { dice[i].lastDieContact = now } }
+            return
+        }
+        guard let i = ia ?? ib else { return }
+        let die = dice[i]
+        let other = ia != nil ? contact.nodeB : contact.nodeA
+        guard let name = other.name else { return }
         // A held die pressed against the edge is not a bounce: no log, no sound.
-        guard case .rolling = mode else { return }
-        lastWallContact = now
-        if now - (lastBounce[name] ?? 0) > 0.15 {
-            lastBounce[name] = now
-            dlog(String(format: "SCENE bounce off %@ (impulse %.1f) at %@", name, contact.collisionImpulse,
-                        dieNode.presentation.position.short))
+        guard case .rolling = die.mode else { return }
+        die.lastWallContact = now
+        if now - (die.lastBounce[name] ?? 0) > 0.15 {
+            die.lastBounce[name] = now
+            dlog(String(format: "SCENE die %d bounce off %@ (impulse %.1f) at %@", i, name, contact.collisionImpulse,
+                        die.node.presentation.position.short))
         }
     }
 }

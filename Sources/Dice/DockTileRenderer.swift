@@ -28,6 +28,15 @@ final class DockTileRenderer {
         dlog("TILE shows empty slot")
     }
 
+    /// Hot Hand banked total as the Dock badge; hidden at zero.
+    func setBadge(_ value: Int) {
+        let label: String? = value > 0 ? "\(value)" : nil
+        guard NSApp.dockTile.badgeLabel != label else { return }
+        NSApp.dockTile.badgeLabel = label
+        NSApp.dockTile.display()
+        dlog("TILE badge -> \(label ?? "none")")
+    }
+
     private func set(_ image: CGImage) {
         let tile = NSApp.dockTile
         imageView.frame = NSRect(origin: .zero, size: tile.size)
