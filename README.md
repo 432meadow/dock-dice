@@ -18,6 +18,7 @@ Dock icon then shows the face you rolled.
 | Right-click the die | It shoots back to the Dock |
 | Drop the die on the Dock | It docks (works with a hidden Dock too) |
 | Right-click the Dock icon | Recall Die, and Sound on/off |
+| Right-click the Dock icon → Dice Style | Pick Classic, Ancient, Glowing or Void; it changes at once and is remembered |
 
 There are a few easter eggs. Finding them is more fun than reading about them, but they are
 listed in [SPEC.md](SPEC.md) if you want spoilers.
@@ -92,6 +93,7 @@ Set these in the environment, for example
 | `DICE_DEMO_STEPS=a,b` | Run only the named demo steps |
 | `DICE_MUTE=1` | Silence all sound and log what would have played |
 | `DICE_REVEAL_DOCK=0` | Do not try to reveal a hidden Dock while the die is held near it |
+| `DICE_STYLE=<name>` | Start in a dice style (`classic`, `ancient`, `glowing`, `void`) without changing the saved choice |
 | `DICE_FRIDAY13=1` / `0` | Force one of the easter eggs on or off |
 | `DICE_BORED_AFTER=<seconds>` | Shorten the idle timer behind another easter egg |
 | `DICE_SHADOW=shadowonly` | Use SceneKit's shadow-only floor instead of the blob shadow |

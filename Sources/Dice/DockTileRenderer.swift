@@ -17,8 +17,21 @@ final class DockTileRenderer {
         let key = "face\(value)-\(palette.name)"
         guard key != current else { return }
         current = key
-        set(DieArt.tileFace(value: value, px: 256, palette: palette))
+        let img = DieArt.tileFace(value: value, px: 256, palette: palette)
+        set(img)
         dlog("TILE shows die face \(value) (\(palette.name))")
+        saveDebugCopy(img, name: "tile-face\(value)-\(palette.name)")
+    }
+
+    /// DICE_SNAPSHOT_DIR: keep a PNG of each tile image set, so the tile can be checked without a screenshot.
+    private func saveDebugCopy(_ img: CGImage, name: String) {
+        guard let dir = env["DICE_SNAPSHOT_DIR"] else { return }
+        let rep = NSBitmapImageRep(cgImage: img)
+        guard let png = rep.representation(using: .png, properties: [:]) else { return }
+        try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+        let url = URL(fileURLWithPath: dir).appendingPathComponent("\(name).png")
+        try? png.write(to: url)
+        dlog("SNAPSHOT \(url.path) (tile image)")
     }
 
     func showEmptySlot() {

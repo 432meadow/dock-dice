@@ -298,6 +298,7 @@ extension AppDelegate {
         g.phase = .scoring
         let scoringDice = t.scoring.map { g.thrown[$0] }
         for i in scoringDice { o.dice.setGlow(true, for: i) }
+        snapshot("game-scoring-glow-\(g.throwCount)", after: 0.3)
         let pts = scoringDice.map { o.localPoint(fromScene: o.dice.position(of: $0)) }
         let c = CGPoint(x: pts.map(\.x).reduce(0, +) / CGFloat(pts.count), y: pts.map(\.y).reduce(0, +) / CGFloat(pts.count) + 34)
         o.hud.floatText("+\(t.points)", at: c)

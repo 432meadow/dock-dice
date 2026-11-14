@@ -72,6 +72,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, InputTapHandler {
     }()
     var fridayActive = false
     var goldActive = false
+    /// Dice Style (Dock menu). Stored in UserDefaults; DICE_STYLE overrides the stored choice at
+    /// launch without changing it. Demo mode keeps its own key so it never touches the real one.
+    static var styleKey: String { isDemo ? "diceStyle.demo" : "diceStyle" }
+    let styleOverride = env["DICE_STYLE"].flatMap { DieStyle(rawValue: $0.lowercased()) }
+    lazy var style: DieStyle = styleOverride
+        ?? UserDefaults.standard.string(forKey: Self.styleKey).flatMap(DieStyle.init(rawValue:)) ?? .classic
+    lazy var launchStyle = style
     var appliedPalette = ""
     var naturalSixes = 0
     var rollLoaded = false
@@ -106,6 +113,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, InputTapHandler {
         dlog("LAUNCH drop-zone self-check \(zc.ok ? "OK" : "FAILED") (band depth \(Int(DropZone.bandDepth)) pt); reveal-Dock rewrite \(revealDock ? "ON" : "OFF (DICE_REVEAL_DOCK=0)")")
         for line in zc.lines { dlog("LAUNCH   zone \(line)") }
         dlog("LAUNCH bored after \(Int(boredAfter)) s (wobble gap \(String(format: "%.1f", boredGap(20))) s, shuffle after \(String(format: "%.1f", boredGap(60))) s); Friday13 override=\(fridayOverride.map { $0 ? "on" : "off" } ?? "none (date)")")
+        if let raw = env["DICE_STYLE"], styleOverride == nil { dlog("LAUNCH DICE_STYLE=\(raw) not recognised (classic|ancient|glowing|void); ignored") }
+        dlog("LAUNCH style \(style.rawValue) (\(styleOverride != nil ? "DICE_STYLE override" : "stored choice, key \(Self.styleKey)"))")
+        _ = launchStyle
         sound = SoundBoard()
         tile = DockTileRenderer()
         refreshSkin("launch")
@@ -175,7 +185,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, InputTapHandler {
     func prewarmOverlay(_ why: String) {
         let t0 = ProcessInfo.processInfo.systemUptime
         let o = ensureOverlay()     // (SCNView.prepare(_:) hung here at launch, so it is not used)
-        o.dice.warmTextures()
+        o.dice.warmTextures(table: style.palette)
         dlog(String(format: "OVERLAY prewarmed (%@) in %.0f ms", why, (ProcessInfo.processInfo.systemUptime - t0) * 1000))
     }
 
@@ -213,6 +223,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, InputTapHandler {
         snd.state = sound.enabled ? .on : .off
         snd.isEnabled = !sound.forcedMute
         menu.addItem(snd)
+        let styles = NSMenu(title: "Dice Style")
+        styles.autoenablesItems = false
+        for s in DieStyle.allCases {
+            let it = NSMenuItem(title: s.title, action: #selector(chooseStyle(_:)), keyEquivalent: "")
+            it.target = self
+            it.representedObject = s.rawValue
+            it.state = s == style ? .on : .off
+            styles.addItem(it)
+        }
+        let styleItem = NSMenuItem(title: "Dice Style", action: nil, keyEquivalent: "")
+        styleItem.submenu = styles
+        menu.addItem(styleItem)
         if bankedTotal > 0 {
             let reset = NSMenuItem(title: "Reset Score", action: #selector(resetScore), keyEquivalent: "")
             reset.target = self
@@ -232,6 +254,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate, InputTapHandler {
     }
 
     @objc func toggleSound() { sound.enabled.toggle() }
+
+    @objc func chooseStyle(_ sender: NSMenuItem) {
+        guard let raw = sender.representedObject as? String, let s = DieStyle(rawValue: raw) else { return }
+        setStyle(s, "Dock menu")
+    }
+
+    /// Switch the dice style now: stored, re-skins a die already out and the tile.
+    func setStyle(_ s: DieStyle, _ why: String) {
+        UserDefaults.standard.set(s.rawValue, forKey: Self.styleKey)
+        guard s != style else { dlog("STYLE \(s.rawValue) chosen again (\(why)); nothing to change"); return }
+        dlog("STYLE \(style.rawValue) -> \(s.rawValue) (\(why); saved under \(Self.styleKey))")
+        style = s
+        let t0 = ProcessInfo.processInfo.systemUptime
+        refreshSkin("style \(s.rawValue): \(why)")
+        dlog(String(format: "STYLE applied in %.0f ms", (ProcessInfo.processInfo.systemUptime - t0) * 1000))
+        // The game's textures for this look, off the critical path (a game starts inside the tap).
+        DispatchQueue.main.async { [weak self] in
+            guard let self, self.style == s, let o = self.overlay else { return }
+            let t1 = ProcessInfo.processInfo.systemUptime
+            o.dice.warmTextures(table: s.palette)
+            dlog(String(format: "STYLE %@ game textures warmed in %.0f ms", s.rawValue, (ProcessInfo.processInfo.systemUptime - t1) * 1000))
+        }
+    }
 
     // MARK: State
 
@@ -351,21 +396,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate, InputTapHandler {
         return c.weekday == 6 && c.day == 13
     }
 
-    /// Gold (hot streak) is a single-die egg: off in game mode.
+    /// Gold (hot streak) is a single-die egg: off in game mode; it beats any style while it lasts.
+    /// Friday the 13th only replaces Classic: a chosen style wins over it.
     func currentPalette() -> DiePalette {
-        (goldActive && game == nil) ? .gold : (fridayActive ? .friday13 : .classic)
+        if goldActive && game == nil { return .gold }
+        if style == .classic && fridayActive { return .friday13 }
+        return style.palette
     }
 
     func refreshSkin(_ why: String) {
         let f = isFriday13Now()
         if f != fridayActive {
             fridayActive = f
-            dlog("FRIDAY13 \(f ? "ON: black die, red pips" : "off") (\(why); override=\(fridayOverride.map { $0 ? "on" : "off" } ?? "none"))")
+            dlog("FRIDAY13 \(f ? (style == .classic ? "ON: black die, red pips" : "ON, but style \(style.rawValue) wins (Friday applies to Classic only)") : "off") (\(why); override=\(fridayOverride.map { $0 ? "on" : "off" } ?? "none"))")
         }
         let p = currentPalette()
         guard p.name != appliedPalette else { return }
         appliedPalette = p.name
-        dlog("SKIN -> \(p.name) (\(why))")
+        dlog("SKIN -> \(p.name) (style \(style.rawValue); \(why))")
         if let o = overlay {
             o.dice.applySkin(p)
             o.hud.applyPalette(p)
@@ -494,6 +542,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, InputTapHandler {
         o.dice.send(.release(velocity: v, angular: w))
         setState(.rolling, "released")
         snapshot("rolling", after: 0.2)
+        if let label = demoStyleLabel {
+            demoStyleLabel = nil
+            snapshot("style-\(label)-tumble-a", after: 0.1)
+            snapshot("style-\(label)-tumble-b", after: 0.3)
+        }
     }
 
     /// drop = short shrink (hand drop); shot = fast accelerating flight with spin (right-click,
@@ -930,9 +983,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, InputTapHandler {
     var demoTimer: Timer?
     var demoInjecting = false
     /// DICE_DEMO_STEPS=step,step,... runs only those steps (names as below).
-    let demoSteps = env["DICE_DEMO_STEPS"].map { $0.split(separator: ",").map(String.init) } ??
+    /// "styles" expands into one step per Dice Style (chosen through the Dock menu's own items,
+    /// a throw in each), then restores the launch style.
+    var demoSteps = env["DICE_DEMO_STEPS"].map { $0.split(separator: ",").map(String.init) } ??
         ["throw", "pause-throw", "shake", "loaded", "right-click", "hand-drop", "trash",
-         "six", "six", "six", "natural", "natural", "friday-off", "throw", "friday-on", "bored"]
+         "six", "six", "six", "natural", "natural", "friday-off", "throw", "friday-on", "styles", "bored"]
+    var demoStyleLabel: String?   // next release snapshots a mid-tumble frame under this name
 
     func inject(_ type: CGEventType, _ p: CGPoint, flags: CGEventFlags = []) -> TapDecision {
         demoInjecting = true
@@ -1043,6 +1099,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate, InputTapHandler {
             refreshSkin("demo \(name)")
             snapshot("skin-\(name)", after: 0.4)
             DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in self?.demoNext() }
+        case "styles":
+            demoSteps.insert(contentsOf: DieStyle.allCases.map { "style:\($0.rawValue)" } + ["style:restore"], at: demoStep)
+            dlog("DEMO styles: cycling \(DieStyle.allCases.map(\.rawValue).joined(separator: ", ")) through the Dock menu, a throw in each")
+            DispatchQueue.main.async { [weak self] in self?.demoNext() }
+        case _ where name.hasPrefix("style:"):
+            let key = String(name.dropFirst(6))
+            let target = key == "restore" ? launchStyle : (DieStyle(rawValue: key) ?? .classic)
+            demoChooseStyleFromMenu(target)
+            if key == "restore" {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in self?.demoNext() }
+            } else {
+                snapshot("style-\(target.rawValue)-rest", after: 0.45)
+                demoStyleLabel = target.rawValue
+                DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) { [weak self] in
+                    guard let self else { return }
+                    self.demoSteps.insert("throw", at: self.demoStep)
+                    self.demoNext()
+                }
+            }
         case "game":
             demoGameStart()
         case "bored":
@@ -1050,6 +1125,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, InputTapHandler {
         default:
             break
         }
+    }
+
+    /// DEMO: pick a style the way the user does, through the Dock menu's own item and action,
+    /// then log the submenu's checkmarks.
+    func demoChooseStyleFromMenu(_ s: DieStyle) {
+        func styleItems() -> [NSMenuItem] {
+            applicationDockMenu(NSApp)?.item(withTitle: "Dice Style")?.submenu?.items ?? []
+        }
+        guard let item = styleItems().first(where: { ($0.representedObject as? String) == s.rawValue }),
+              let action = item.action else {
+            dlog("DEMO style: no Dice Style menu item for \(s.rawValue)")
+            return
+        }
+        NSApp.sendAction(action, to: item.target, from: item)
+        dlog("DEMO style menu after choosing \(item.title): " + styleItems().map { "\($0.title)\($0.state == .on ? " [x]" : "")" }.joined(separator: ", "))
     }
 
     // MARK: Debug snapshots (DICE_SNAPSHOT_DIR)

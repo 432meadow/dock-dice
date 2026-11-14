@@ -87,6 +87,13 @@ final class DiceScene: NSObject, SCNSceneRendererDelegate, SCNPhysicsContactDele
         let visual = SCNNode()        // carries the geometry; scaled for cues and animations
         var blob: SCNNode?
         var materials: [SCNMaterial] = []
+        // Main thread: the look this die wears now, and whether the scoring glow is on.
+        var look = DiePalette.classic
+        var glowOn = false
+        // Floor under the die (written on main, read on the render thread under the lock):
+        // shadow offset factor (1 follows the key light, 0 centred) and opacity factor.
+        var blobShift: CGFloat = 1
+        var blobStrength: CGFloat = 1
         // Render-thread state
         var mode = Mode.idle
         var quiet: TimeInterval = 0
@@ -153,7 +160,16 @@ final class DiceScene: NSObject, SCNSceneRendererDelegate, SCNPhysicsContactDele
     private var lastSimTime: TimeInterval?
     private var lastAnyHit: TimeInterval = 0
     private var lastOverlapLog: [Int: TimeInterval] = [:]
-    private var textureCache: [String: [CGImage]] = [:]
+    /// Face maps for one look: the diffuse textures, and the emission maps if the look has them.
+    /// Material order +z, +x, -z, -x, +y, -y.
+    struct FaceMaps {
+        let diffuse: [CGImage]
+        let emission: [CGImage]?
+    }
+    private var textureCache: [String: FaceMaps] = [:]
+    /// Emission maps with the scoring glow as background, for looks that have emission maps.
+    private var washCache: [String: [CGImage]] = [:]
+    private var floorCache: [String: CGImage] = [:]
     private(set) var palette = DiePalette.classic
     /// Pip style for all dice: plain for the single die, constellation for Hot Hand.
     private(set) var pipStyle = PipStyle.plain
@@ -239,22 +255,50 @@ final class DiceScene: NSObject, SCNSceneRendererDelegate, SCNPhysicsContactDele
 
     // MARK: Looks (main thread; SceneKit property changes are safe here inside a transaction)
 
-    private func textures(for p: DiePalette, wild: Bool = false) -> [CGImage] {
+    private static let faceOrder = [1, 2, 6, 5, 3, 4]
+
+    private func textures(for p: DiePalette, wild: Bool = false) -> FaceMaps {
         let key = "\(p.name)-\(pipStyle.rawValue)\(wild ? "-wild" : "")"
         if let t = textureCache[key] { return t }
-        let t = [1, 2, 6, 5, 3, 4].map { DieArt.texture(value: $0, px: 512, palette: p, style: pipStyle, wild: wild) }
+        let style = pipStyle
+        let t = FaceMaps(diffuse: Self.faceOrder.map { DieArt.texture(value: $0, px: 512, palette: p, style: style, wild: wild) },
+                         emission: p.emissive ? Self.faceOrder.compactMap { DieArt.emissionTexture(value: $0, px: 512, palette: p, style: style) } : nil)
         textureCache[key] = t
         return t
     }
 
-    /// Build the Hot Hand textures ahead of time (launch), so starting a game inside the event
-    /// tap does not draw them there.
-    func warmTextures() {
+    private func washed(for p: DiePalette) -> [CGImage] {
+        let key = "\(p.name)-\(pipStyle.rawValue)"
+        if let t = washCache[key] { return t }
+        let c = DieArt.scoreGlow.components ?? [1, 1, 1, 1], k = DieArt.scoreGlowIntensity
+        let wash = CGColor(colorSpace: DieArt.sRGB, components: [c[0] * k, c[1] * k, c[2] * k, 1])!
+        let style = pipStyle
+        let t = Self.faceOrder.compactMap { DieArt.emissionTexture(value: $0, px: 512, palette: p, style: style, wash: wash) }
+        washCache[key] = t
+        return t
+    }
+
+    private func floorImage(for p: DiePalette) -> CGImage {
+        let key = p.floor.halo == nil ? "shadow" : p.name
+        if let t = floorCache[key] { return t }
+        let t = DieArt.floorImage(p)
+        floorCache[key] = t
+        return t
+    }
+
+    /// Build the Hot Hand textures ahead of time (launch, style change), so starting a game
+    /// inside the event tap does not draw them there. `table` is the chosen style's look.
+    func warmTextures(table: DiePalette = .classic) {
         let saved = pipStyle
         pipStyle = .constellation
-        for p in [DiePalette.classic, .friday13] { _ = textures(for: p) }
+        for p in [DiePalette.classic, .friday13, table] {
+            _ = textures(for: p)
+            if p.emissive { _ = washed(for: p) }
+        }
         _ = textures(for: .gold, wild: true)
         pipStyle = saved
+        _ = textures(for: table)
+        _ = floorImage(for: table)
     }
 
     /// Make one die the special (gold, wild) die, or none. Re-skins everything.
@@ -273,6 +317,8 @@ final class DiceScene: NSObject, SCNSceneRendererDelegate, SCNPhysicsContactDele
         dlog("SCENE pip style -> \(style.rawValue)")
     }
 
+    /// Dress every die in a look: textures, emission, material finish, corner radius and the
+    /// floor (shadow or halo). The special die stays gold whatever the table look.
     func applySkin(_ p: DiePalette) {
         palette = p
         SCNTransaction.begin()
@@ -281,49 +327,95 @@ final class DiceScene: NSObject, SCNSceneRendererDelegate, SCNPhysicsContactDele
             // The special die is gold whatever the table palette (never black or red).
             let special = die.index == specialDie
             let dp = special ? DiePalette.gold : p
-            let tex = textures(for: dp, wild: special)
+            die.look = dp
+            let maps = textures(for: dp, wild: special)
+            let f = dp.finish
             for (i, m) in die.materials.enumerated() {
-                m.diffuse.contents = tex[i]
-                switch dp.name {
-                case "gold":
-                    m.specular.contents = NSColor(srgbRed: 1.0, green: 0.86, blue: 0.48, alpha: 1)
-                    m.shininess = 0.8
+                m.diffuse.contents = maps.diffuse[i]
+                m.lightingModel = f.lighting == .lambert ? .lambert : .blinn
+                m.specular.contents = NSColor(cgColor: f.specular)
+                m.shininess = f.shininess
+                switch f.reflection {
+                case .none:
+                    m.reflective.contents = nil
+                case .gold:
                     m.reflective.contents = DieArt.goldReflection()
                     m.reflective.intensity = 0.55
                     m.fresnelExponent = 1.2
-                case "friday13":
-                    // Tight highlight only: a broad one washes the black top face out to grey.
-                    m.specular.contents = NSColor(white: 0.2, alpha: 1)
-                    m.shininess = 1.0
-                    m.reflective.contents = nil
-                default:
-                    m.specular.contents = NSColor(white: 0.35, alpha: 1)
-                    m.shininess = 0.35
-                    m.reflective.contents = nil
+                case let .rim(color, exponent, intensity):
+                    // Uniform "environment" weighted by fresnel: shows only at grazing angles,
+                    // i.e. on the chamfers and the side faces as the die tumbles.
+                    m.reflective.contents = NSColor(cgColor: color)
+                    m.reflective.intensity = intensity
+                    m.fresnelExponent = exponent
                 }
+            }
+            applyEmission(die)
+            if let box = die.visual.geometry as? SCNBox, box.chamferRadius != dp.chamfer { box.chamferRadius = dp.chamfer }
+            if let blob = die.blob, let plane = blob.geometry as? SCNPlane {
+                plane.width = dp.floor.size
+                plane.height = dp.floor.size
+                plane.firstMaterial?.diffuse.contents = floorImage(for: dp)
+                lock.lock()
+                die.blobShift = dp.floor.follows ? 1 : 0
+                die.blobStrength = dp.floor.halo == nil ? dp.floor.shadow : 1
+                lock.unlock()
             }
         }
         SCNTransaction.commit()
-        dlog("SCENE skin -> \(p.name) (\(pipStyle.rawValue) pips\(specialDie.map { ", die \($0) gold+wild" } ?? ""))")
+        dlog("SCENE skin -> \(p.name) (\(pipStyle.rawValue) pips, chamfer \(p.chamfer), \(p.emissive ? "emission map" : "no emission")\(p.floor.halo != nil ? ", halo" : "")\(specialDie.map { ", die \($0) gold+wild" } ?? ""))")
     }
 
-    /// The loaded die's wink: die 0's 6 face (material index 2) loses its pips for a moment.
+    /// The emission slot: the look's emission map (or nothing), or the scoring glow on top.
+    /// Looks with an emission map get the glow as a washed map, since the slot holds one thing.
+    private func applyEmission(_ die: Die) {
+        let special = die.index == specialDie
+        let maps = textures(for: die.look, wild: special)
+        let wash = die.glowOn && maps.emission != nil ? washed(for: die.look) : nil
+        for (i, m) in die.materials.enumerated() {
+            if let w = wash {
+                m.emission.contents = w[i]
+                m.emission.intensity = 1
+            } else if let e = maps.emission {
+                m.emission.contents = e[i]
+                m.emission.intensity = 1
+            } else if die.glowOn {
+                m.emission.contents = NSColor(cgColor: DieArt.scoreGlow)
+                m.emission.intensity = DieArt.scoreGlowIntensity
+            } else {
+                m.emission.contents = NSColor.black
+                m.emission.intensity = 0
+            }
+        }
+    }
+
+    /// The loaded die's wink: die 0's 6 face (material index 2) loses its pips for a moment
+    /// (and their light, for looks that give off light; a rim stays).
     func setWink(_ closed: Bool) {
-        let m = dice[0].materials[2]
+        let die = dice[0]
+        let m = die.materials[2]
+        let p = die.look
         SCNTransaction.begin()
         SCNTransaction.disableActions = true
-        m.diffuse.contents = closed ? DieArt.texture(value: 6, px: 512, palette: palette, pips: false, style: pipStyle) : textures(for: palette)[2]
+        if closed {
+            m.diffuse.contents = DieArt.texture(value: 6, px: 512, palette: p, pips: false, style: pipStyle)
+            if p.emissive { m.emission.contents = DieArt.emissionTexture(value: 6, px: 512, palette: p, pips: false, style: pipStyle) }
+        } else {
+            let maps = textures(for: p)
+            m.diffuse.contents = maps.diffuse[2]
+            if let e = maps.emission { m.emission.contents = e[2] }
+        }
         SCNTransaction.commit()
     }
 
-    /// A soft warm glow (scoring dice), animated.
+    /// A soft warm glow (scoring dice), animated (looks with an emission map switch maps instead).
     func setGlow(_ on: Bool, for i: Int) {
+        let die = dice[i]
+        guard die.glowOn != on else { return }
+        die.glowOn = on
         SCNTransaction.begin()
         SCNTransaction.animationDuration = on ? 0.18 : 0.45
-        for m in dice[i].materials {
-            m.emission.contents = on ? NSColor(srgbRed: 1.0, green: 0.78, blue: 0.42, alpha: 1) : NSColor.black
-            m.emission.intensity = on ? 0.38 : 0
-        }
+        applyEmission(die)
         SCNTransaction.commit()
     }
 
@@ -332,6 +424,10 @@ final class DiceScene: NSObject, SCNSceneRendererDelegate, SCNPhysicsContactDele
         SCNTransaction.begin()
         SCNTransaction.animationDuration = 0.35
         for m in dice[i].materials { m.multiply.contents = NSColor(white: level, alpha: 1) }
+        // A halo is light from the die, so it slumps with it (a shadow is unaffected in practice).
+        if dice[i].look.floor.halo != nil || level == 1 {
+            dice[i].blob?.geometry?.firstMaterial?.multiply.contents = NSColor(white: level, alpha: 1)
+        }
         SCNTransaction.commit()
     }
 
@@ -921,14 +1017,17 @@ final class DiceScene: NSObject, SCNSceneRendererDelegate, SCNPhysicsContactDele
             }
         }
 
-        lock.lock(); die.published = p; lock.unlock()
+        lock.lock()
+        die.published = p
+        let shift = die.blobShift, strength = die.blobStrength
+        lock.unlock()
 
         if !node.isHidden, let blob = die.blob {
             let hgt = max(0, p.z - 0.5)
             let s = 1 + 0.45 * hgt
             blob.scale = SCNVector3(s, s, 1)
-            blob.position = SCNVector3(p.x + 0.1 + 0.12 * hgt, p.y - 0.12 - 0.15 * hgt, 0.002)
-            blob.opacity = max(0.25, 0.85 - 0.3 * hgt)
+            blob.position = SCNVector3(p.x + shift * (0.1 + 0.12 * hgt), p.y - shift * (0.12 + 0.15 * hgt), 0.002)
+            blob.opacity = max(0.25, 0.85 - 0.3 * hgt) * strength
         }
 
         // Game mode: a settled die knocked by another one starts rolling again.

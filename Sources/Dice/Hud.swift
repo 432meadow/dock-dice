@@ -46,12 +46,17 @@ final class HudView: NSView {
 
     private var scale: CGFloat { window?.backingScaleFactor ?? 2 }
 
-    /// Follow the die palette: ivory with dark numerals, or dark with red on Friday the 13th.
+    /// Follow the die palette: ivory with dark numerals, dark with red on Friday the 13th, and
+    /// for the styled looks the die's own body with its pip colour (aqua or white on dark).
     func applyPalette(_ p: DiePalette) {
         if p.name == "friday13" {
             bg = NSColor(srgbRed: 0.10, green: 0.10, blue: 0.11, alpha: 0.96)
             fg = NSColor(srgbRed: 0.95, green: 0.36, blue: 0.30, alpha: 1)
             edge = NSColor(white: 1, alpha: 0.14)
+        } else if p.surface != .plain {
+            bg = (NSColor(cgColor: p.surface == .void ? DieArt.grey(0.03) : p.body) ?? .black).withAlphaComponent(0.96)
+            fg = NSColor(cgColor: p.glow ?? p.pipOuter) ?? .white
+            edge = NSColor(cgColor: p.edge) ?? NSColor(white: 0, alpha: 0.10)
         } else {
             bg = NSColor(srgbRed: 0.975, green: 0.962, blue: 0.925, alpha: 0.96)
             fg = NSColor(srgbRed: 0.16, green: 0.16, blue: 0.17, alpha: 1)
